@@ -16,3 +16,7 @@ node_modules/
 
 # OS
 .DS_Store
+
+# Uploads
+backend/uploads/*
+!backend/uploads/.gitkeep

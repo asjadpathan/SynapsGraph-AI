@@ -1,6 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from dotenv import load_dotenv
 import os
+import shutil
+import uuid
 import psycopg2
 from neo4j import GraphDatabase
 from qdrant_client import QdrantClient
@@ -9,6 +11,8 @@ import redis
 load_dotenv()
 
 app = FastAPI(title="Research Paper Discovery Platform")
+
+UPLOAD_DIR = "uploads"
 
 @app.get("/")
 def read_root():
@@ -67,3 +71,23 @@ def health_check():
         status["redis"] = f"error: {str(e)}"
 
     return status
+
+@app.post("/upload")
+async def upload_paper(file: UploadFile = File(...)):
+    # Sirf PDF allow karo
+    if not file.filename.endswith(".pdf"):
+        return {"error": "Only PDF files are allowed"}
+
+    # Unique filename banao (taaki do papers same naam se overwrite na ho)
+    unique_id = str(uuid.uuid4())
+    file_path = f"{UPLOAD_DIR}/{unique_id}_{file.filename}"
+
+    # File save karo
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    return {
+        "message": "File uploaded successfully",
+        "filename": file.filename,
+        "saved_as": file_path
+    }
