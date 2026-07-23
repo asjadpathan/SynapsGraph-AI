@@ -42,6 +42,13 @@ services:
     ports:
       - "6379:6379"
 
+  grobid:
+    image: lfoppiano/grobid:0.8.1
+    container_name: research_grobid
+    restart: always
+    ports:
+      - "8070:8070"
+
 volumes:
   postgres_data:
   neo4j_data:
