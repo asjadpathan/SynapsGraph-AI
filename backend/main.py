@@ -17,9 +17,14 @@ app = FastAPI(title="Research Paper Discovery Platform")
 UPLOAD_DIR = "uploads"
 GROBID_URL = os.getenv("GROBID_URL")
 
+# Neo4j driver ek hi baar banate hain, poori app ke liye reuse hoga
+neo4j_driver = GraphDatabase.driver(
+    os.getenv("NEO4J_URI"),
+    auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
+)
+
 
 def get_postgres_connection():
-    """Har baar ek naya Postgres connection deta hai"""
     return psycopg2.connect(
         host=os.getenv("POSTGRES_HOST"),
         port=os.getenv("POSTGRES_PORT"),
@@ -46,12 +51,7 @@ def health_check():
         status["postgres"] = f"error: {str(e)}"
 
     try:
-        driver = GraphDatabase.driver(
-            os.getenv("NEO4J_URI"),
-            auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
-        )
-        driver.verify_connectivity()
-        driver.close()
+        neo4j_driver.verify_connectivity()
         status["neo4j"] = "connected"
     except Exception as e:
         status["neo4j"] = f"error: {str(e)}"
@@ -80,7 +80,6 @@ def health_check():
 
 
 def parse_pdf_with_grobid(file_path: str):
-    """GROBID ko PDF bhejta hai aur title, authors, abstract nikaalta hai"""
     url = f"{GROBID_URL}/api/processHeaderDocument"
 
     with open(file_path, "rb") as f:
@@ -121,7 +120,6 @@ def parse_pdf_with_grobid(file_path: str):
 
 
 def save_paper_to_postgres(unique_id, filename, file_path, parsed_data):
-    """Parsed paper data ko Postgres me save karta hai"""
     conn = get_postgres_connection()
     cur = conn.cursor()
 
@@ -149,6 +147,35 @@ def save_paper_to_postgres(unique_id, filename, file_path, parsed_data):
     return paper_id
 
 
+def create_paper_node_in_neo4j(paper_id, unique_id, title, authors):
+    """Neo4j me ek Paper node banata hai, aur har author ke liye Author node + relationship banata hai"""
+    with neo4j_driver.session() as session:
+        # Paper node banao
+        session.run(
+            """
+            MERGE (p:Paper {paper_id: $paper_id})
+            SET p.unique_id = $unique_id,
+                p.title = $title
+            """,
+            paper_id=paper_id,
+            unique_id=unique_id,
+            title=title
+        )
+
+        # Har author ke liye Author node banao aur Paper se link karo
+        for author_name in authors:
+            session.run(
+                """
+                MERGE (a:Author {name: $author_name})
+                WITH a
+                MATCH (p:Paper {paper_id: $paper_id})
+                MERGE (a)-[:AUTHORED]->(p)
+                """,
+                author_name=author_name,
+                paper_id=paper_id
+            )
+
+
 @app.post("/upload")
 async def upload_paper(file: UploadFile = File(...)):
     if not file.filename.endswith(".pdf"):
@@ -172,8 +199,16 @@ async def upload_paper(file: UploadFile = File(...)):
 
     paper_id = save_paper_to_postgres(unique_id, file.filename, file_path, parsed_data)
 
+    # Neo4j me bhi node banao
+    create_paper_node_in_neo4j(
+        paper_id,
+        unique_id,
+        parsed_data.get("title"),
+        parsed_data.get("authors", [])
+    )
+
     return {
-        "message": "File uploaded, parsed, and saved successfully",
+        "message": "File uploaded, parsed, saved, and added to knowledge graph",
         "paper_id": paper_id,
         "filename": file.filename,
         "saved_as": file_path,
@@ -183,7 +218,6 @@ async def upload_paper(file: UploadFile = File(...)):
 
 @app.get("/papers")
 def get_all_papers():
-    """Saare uploaded papers ki list deta hai"""
     conn = get_postgres_connection()
     cur = conn.cursor()
 
