@@ -17,22 +17,29 @@ app = FastAPI(title="Research Paper Discovery Platform")
 UPLOAD_DIR = "uploads"
 GROBID_URL = os.getenv("GROBID_URL")
 
+
+def get_postgres_connection():
+    """Har baar ek naya Postgres connection deta hai"""
+    return psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST"),
+        port=os.getenv("POSTGRES_PORT"),
+        dbname=os.getenv("POSTGRES_DB"),
+        user=os.getenv("POSTGRES_USER"),
+        password=os.getenv("POSTGRES_PASSWORD"),
+    )
+
+
 @app.get("/")
 def read_root():
     return {"message": "Backend is running!"}
+
 
 @app.get("/health")
 def health_check():
     status = {}
 
     try:
-        conn = psycopg2.connect(
-            host=os.getenv("POSTGRES_HOST"),
-            port=os.getenv("POSTGRES_PORT"),
-            dbname=os.getenv("POSTGRES_DB"),
-            user=os.getenv("POSTGRES_USER"),
-            password=os.getenv("POSTGRES_PASSWORD"),
-        )
+        conn = get_postgres_connection()
         conn.close()
         status["postgres"] = "connected"
     except Exception as e:
@@ -81,22 +88,16 @@ def parse_pdf_with_grobid(file_path: str):
         headers = {"Accept": "application/xml"}
         response = requests.post(url, files=files, headers=headers)
 
-    print("GROBID STATUS CODE:", response.status_code)
-    print("GROBID RESPONSE (first 500 chars):", response.text[:500])
-
     if response.status_code != 200:
         return {"error": f"GROBID failed with status {response.status_code}", "raw_response": response.text[:500]}
 
-    # GROBID XML (TEI format) return karta hai, usse parse karte hain
     xml_content = response.text
     ns = {"tei": "http://www.tei-c.org/ns/1.0"}
     root = ET.fromstring(xml_content)
 
-    # Title nikaalo
     title_elem = root.find(".//tei:titleStmt/tei:title", ns)
     title = title_elem.text if title_elem is not None else "Unknown Title"
 
-    # Authors nikaalo
     authors = []
     for author in root.findall(".//tei:sourceDesc//tei:author/tei:persName", ns):
         forename = author.find("tei:forename", ns)
@@ -109,7 +110,6 @@ def parse_pdf_with_grobid(file_path: str):
         if name_parts:
             authors.append(" ".join(name_parts))
 
-    # Abstract nikaalo
     abstract_elem = root.find(".//tei:abstract//tei:p", ns)
     abstract = abstract_elem.text if abstract_elem is not None else "No abstract found"
 
@@ -118,6 +118,35 @@ def parse_pdf_with_grobid(file_path: str):
         "authors": authors,
         "abstract": abstract
     }
+
+
+def save_paper_to_postgres(unique_id, filename, file_path, parsed_data):
+    """Parsed paper data ko Postgres me save karta hai"""
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO papers (unique_id, filename, file_path, title, authors, abstract)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id;
+        """,
+        (
+            unique_id,
+            filename,
+            file_path,
+            parsed_data.get("title"),
+            parsed_data.get("authors"),
+            parsed_data.get("abstract"),
+        )
+    )
+
+    paper_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return paper_id
 
 
 @app.post("/upload")
@@ -131,12 +160,49 @@ async def upload_paper(file: UploadFile = File(...)):
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # GROBID se parse karwao
     parsed_data = parse_pdf_with_grobid(file_path)
 
+    if "error" in parsed_data:
+        return {
+            "message": "File uploaded but parsing failed",
+            "filename": file.filename,
+            "saved_as": file_path,
+            "parsed_data": parsed_data
+        }
+
+    paper_id = save_paper_to_postgres(unique_id, file.filename, file_path, parsed_data)
+
     return {
-        "message": "File uploaded and parsed successfully",
+        "message": "File uploaded, parsed, and saved successfully",
+        "paper_id": paper_id,
         "filename": file.filename,
         "saved_as": file_path,
         "parsed_data": parsed_data
     }
+
+
+@app.get("/papers")
+def get_all_papers():
+    """Saare uploaded papers ki list deta hai"""
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id, unique_id, filename, title, authors, abstract, uploaded_at FROM papers ORDER BY uploaded_at DESC;")
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    papers = []
+    for row in rows:
+        papers.append({
+            "id": row[0],
+            "unique_id": str(row[1]),
+            "filename": row[2],
+            "title": row[3],
+            "authors": row[4],
+            "abstract": row[5],
+            "uploaded_at": str(row[6])
+        })
+
+    return {"papers": papers}
