@@ -19,7 +19,7 @@ services:
     container_name: research_neo4j
     restart: always
     environment:
-      NEO4J_AUTH: neo4j/research_pass
+      NEO4J_AUTH: neo4j/abc12345678
     ports:
       - "7474:7474"
       - "7687:7687"
