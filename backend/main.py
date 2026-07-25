@@ -10,6 +10,7 @@ from neo4j import GraphDatabase
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
+from google import genai
 import redis
 
 load_dotenv()
@@ -20,24 +21,27 @@ UPLOAD_DIR = "uploads"
 GROBID_URL = os.getenv("GROBID_URL")
 QDRANT_COLLECTION = "papers"
 
-# Neo4j driver ek hi baar banate hain, poori app ke liye reuse hoga
+# Create Neo4j driver once, reused across the whole app
 neo4j_driver = GraphDatabase.driver(
     os.getenv("NEO4J_URI"),
     auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
 )
 
-# Qdrant client ek hi baar banate hain
+# Create Qdrant client once
 qdrant_client = QdrantClient(
     host=os.getenv("QDRANT_HOST"),
     port=int(os.getenv("QDRANT_PORT"))
 )
 
-# Embedding model ek hi baar load karte hain (server start hote waqt)
-print("Loading embedding model... (pehli baar thoda time lagega)")
+# Create Gemini client once
+gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+# Load embedding model once at server startup
+print("Loading embedding model... (this takes a bit of time the first time)")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 print("Embedding model loaded!")
 
-# Qdrant me collection banao agar already nahi hai
+# Create the Qdrant collection if it doesn't already exist
 try:
     qdrant_client.get_collection(QDRANT_COLLECTION)
 except Exception:
@@ -167,7 +171,7 @@ def save_paper_to_postgres(unique_id, filename, file_path, parsed_data):
 
 
 def create_paper_node_in_neo4j(paper_id, unique_id, title, authors):
-    """Neo4j me ek Paper node banata hai, aur har author ke liye Author node + relationship banata hai"""
+    """Creates a Paper node in Neo4j, and an Author node + relationship for each author"""
     with neo4j_driver.session() as session:
         session.run(
             """
@@ -194,7 +198,7 @@ def create_paper_node_in_neo4j(paper_id, unique_id, title, authors):
 
 
 def save_embedding_to_qdrant(paper_id, title, abstract):
-    """Paper ke title+abstract ka embedding banata hai aur Qdrant me save karta hai"""
+    """Generates an embedding for the paper's title+abstract and saves it in Qdrant"""
     text_to_embed = f"{title}. {abstract}"
     embedding = embedding_model.encode(text_to_embed).tolist()
 
@@ -286,7 +290,7 @@ def get_all_papers():
 
 @app.get("/search")
 def semantic_search(query: str, limit: int = 5):
-    """Meaning-based search — query ko embedding me convert karke similar papers dhoondta hai"""
+    """Meaning-based search - converts the query into an embedding and finds similar papers"""
     query_embedding = embedding_model.encode(query).tolist()
 
     results = qdrant_client.query_points(
@@ -309,9 +313,9 @@ def semantic_search(query: str, limit: int = 5):
 
 @app.get("/author-network")
 def get_author_network():
-    """Authors ke beech co-authorship network — readable, paper-wise grouped format me"""
+    """Returns co-authorship network between authors, in a readable, paper-grouped format"""
     with neo4j_driver.session() as session:
-        # Har paper ke saare authors nikaalo (grouped)
+        # Get all authors grouped by paper
         paper_result = session.run(
             """
             MATCH (a:Author)-[:AUTHORED]->(p:Paper)
@@ -322,7 +326,7 @@ def get_author_network():
 
         collaborations_by_paper = []
         for record in paper_result:
-            if len(record["authors"]) > 1:  # Sirf multi-author papers dikhao (collaboration hai)
+            if len(record["authors"]) > 1:  # Only show multi-author papers (actual collaboration)
                 collaborations_by_paper.append({
                     "paper_id": record["paper_id"],
                     "paper_title": record["paper_title"] or "Untitled",
@@ -330,7 +334,7 @@ def get_author_network():
                     "author_count": len(record["authors"])
                 })
 
-        # Top authors (sabse zyada papers likhne wale)
+        # Top authors (most papers written)
         author_result = session.run(
             """
             MATCH (a:Author)-[:AUTHORED]->(p:Paper)
@@ -361,9 +365,11 @@ def get_author_network():
         "top_authors": top_authors,
         "collaborations_by_paper": collaborations_by_paper
     }
+
+
 @app.get("/timeline")
 def get_research_timeline():
-    """Papers ko upload date ke hisab se group karke timeline data deta hai"""
+    """Groups papers by upload month and returns timeline data"""
     conn = get_postgres_connection()
     cur = conn.cursor()
 
@@ -394,4 +400,51 @@ def get_research_timeline():
     return {
         "timeline": timeline,
         "total_months": len(timeline)
+    }
+
+
+@app.get("/ask")
+def ask_question(question: str, context_limit: int = 3):
+    """Takes a user question, finds relevant papers, and generates an answer using Gemini"""
+
+    # Step 1: Find relevant papers (same approach as /search)
+    query_embedding = embedding_model.encode(question).tolist()
+    results = qdrant_client.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=query_embedding,
+        limit=context_limit
+    ).points
+
+    if not results:
+        return {"question": question, "answer": "No relevant paper was found.", "sources": []}
+
+    # Step 2: Build context from those papers' abstracts
+    context_text = ""
+    sources = []
+    for r in results:
+        title = r.payload.get("title", "Unknown")
+        abstract = r.payload.get("abstract", "")
+        context_text += f"\n\nPaper Title: {title}\nAbstract: {abstract}"
+        sources.append({"paper_id": r.id, "title": title, "score": r.score})
+
+    # Step 3: Send the prompt to Gemini
+    prompt = f"""Answer the question below using only the research paper abstracts provided as context.
+Only answer from the given context. If the answer is not present in the context, say "The answer to this question was not found in the given context."
+
+Context:
+{context_text}
+
+Question: {question}
+
+Answer:"""
+
+    response = gemini_client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt
+    )
+
+    return {
+        "question": question,
+        "answer": response.text,
+        "sources": sources
     }
