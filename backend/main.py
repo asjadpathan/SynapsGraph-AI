@@ -361,3 +361,37 @@ def get_author_network():
         "top_authors": top_authors,
         "collaborations_by_paper": collaborations_by_paper
     }
+@app.get("/timeline")
+def get_research_timeline():
+    """Papers ko upload date ke hisab se group karke timeline data deta hai"""
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT 
+            TO_CHAR(uploaded_at, 'YYYY-MM') AS month,
+            COUNT(*) AS paper_count,
+            ARRAY_AGG(title) AS titles
+        FROM papers
+        GROUP BY TO_CHAR(uploaded_at, 'YYYY-MM')
+        ORDER BY month ASC;
+        """
+    )
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    timeline = []
+    for row in rows:
+        timeline.append({
+            "month": row[0],
+            "paper_count": row[1],
+            "titles": row[2]
+        })
+
+    return {
+        "timeline": timeline,
+        "total_months": len(timeline)
+    }
