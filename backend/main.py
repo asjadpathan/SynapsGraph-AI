@@ -1,8 +1,14 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import os
 import shutil
 import uuid
+import hashlib
 import requests
 import xml.etree.ElementTree as ET
 import psycopg2
@@ -20,6 +26,14 @@ app = FastAPI(title="Research Paper Discovery Platform")
 UPLOAD_DIR = "uploads"
 GROBID_URL = os.getenv("GROBID_URL")
 QDRANT_COLLECTION = "papers"
+
+# --- Authentication settings ---
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = 60 * 24  # tokens are valid for 24 hours
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # Create Neo4j driver once, reused across the whole app
 neo4j_driver = GraphDatabase.driver(
@@ -60,6 +74,99 @@ def get_postgres_connection():
         password=os.getenv("POSTGRES_PASSWORD"),
     )
 
+
+# ============================================================
+# AUTHENTICATION HELPERS
+# ============================================================
+
+class SignupRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def create_access_token(user_id: int, username: str) -> str:
+    expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    payload = {"sub": str(user_id), "username": username, "exp": expire}
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    """Decodes the JWT token and returns the current user's id and username.
+    Raises an error if the token is missing or invalid."""
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        username = payload.get("username")
+        if user_id is None:
+            raise credentials_exception
+        return {"user_id": int(user_id), "username": username}
+    except JWTError:
+        raise credentials_exception
+
+
+@app.post("/signup")
+def signup(request: SignupRequest):
+    """Registers a new user account"""
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+
+    # Check if username or email is already taken
+    cur.execute("SELECT id FROM users WHERE username = %s OR email = %s;", (request.username, request.email))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username or email is already registered")
+
+    hashed = hash_password(request.password)
+    cur.execute(
+        "INSERT INTO users (username, email, hashed_password) VALUES (%s, %s, %s) RETURNING id;",
+        (request.username, request.email, hashed)
+    )
+    user_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    token = create_access_token(user_id, request.username)
+    return {"message": "Account created successfully", "access_token": token, "token_type": "bearer"}
+
+
+@app.post("/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """Logs in an existing user and returns an access token"""
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id, username, hashed_password FROM users WHERE username = %s;", (form_data.username,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row or not verify_password(form_data.password, row[2]):
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    user_id, username, _ = row
+    token = create_access_token(user_id, username)
+    return {"access_token": token, "token_type": "bearer"}
+
+
+# ============================================================
+# GENERAL ENDPOINTS
+# ============================================================
 
 @app.get("/")
 def read_root():
@@ -102,6 +209,28 @@ def health_check():
     return status
 
 
+def calculate_file_hash(file_path: str) -> str:
+    """Calculates a SHA-256 hash of the file content, used to detect duplicate uploads"""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(chunk)
+    return sha256_hash.hexdigest()
+
+
+def find_existing_paper_by_hash(file_hash: str, user_id: int):
+    """Checks if this user already uploaded a paper with this exact file hash"""
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, title FROM papers WHERE file_hash = %s AND user_id = %s;", (file_hash, user_id))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if row:
+        return {"id": row[0], "title": row[1]}
+    return None
+
+
 def parse_pdf_with_grobid(file_path: str):
     url = f"{GROBID_URL}/api/processHeaderDocument"
 
@@ -142,23 +271,25 @@ def parse_pdf_with_grobid(file_path: str):
     }
 
 
-def save_paper_to_postgres(unique_id, filename, file_path, parsed_data):
+def save_paper_to_postgres(unique_id, filename, file_path, file_hash, parsed_data, user_id):
     conn = get_postgres_connection()
     cur = conn.cursor()
 
     cur.execute(
         """
-        INSERT INTO papers (unique_id, filename, file_path, title, authors, abstract)
-        VALUES (%s, %s, %s, %s, %s, %s)
+        INSERT INTO papers (unique_id, filename, file_path, file_hash, title, authors, abstract, user_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id;
         """,
         (
             unique_id,
             filename,
             file_path,
+            file_hash,
             parsed_data.get("title"),
             parsed_data.get("authors"),
             parsed_data.get("abstract"),
+            user_id,
         )
     )
 
@@ -170,18 +301,21 @@ def save_paper_to_postgres(unique_id, filename, file_path, parsed_data):
     return paper_id
 
 
-def create_paper_node_in_neo4j(paper_id, unique_id, title, authors):
-    """Creates a Paper node in Neo4j, and an Author node + relationship for each author"""
+def create_paper_node_in_neo4j(paper_id, unique_id, title, authors, user_id):
+    """Creates a Paper node in Neo4j, and an Author node + relationship for each author.
+    The Paper node also stores which user owns it."""
     with neo4j_driver.session() as session:
         session.run(
             """
             MERGE (p:Paper {paper_id: $paper_id})
             SET p.unique_id = $unique_id,
-                p.title = $title
+                p.title = $title,
+                p.user_id = $user_id
             """,
             paper_id=paper_id,
             unique_id=unique_id,
-            title=title
+            title=title,
+            user_id=user_id
         )
 
         for author_name in authors:
@@ -197,8 +331,9 @@ def create_paper_node_in_neo4j(paper_id, unique_id, title, authors):
             )
 
 
-def save_embedding_to_qdrant(paper_id, title, abstract):
-    """Generates an embedding for the paper's title+abstract and saves it in Qdrant"""
+def save_embedding_to_qdrant(paper_id, title, abstract, user_id):
+    """Generates an embedding for the paper's title+abstract and saves it in Qdrant,
+    tagged with the owning user's id so searches can be scoped per user."""
     text_to_embed = f"{title}. {abstract}"
     embedding = embedding_model.encode(text_to_embed).tolist()
 
@@ -210,23 +345,41 @@ def save_embedding_to_qdrant(paper_id, title, abstract):
                 vector=embedding,
                 payload={
                     "title": title,
-                    "abstract": abstract
+                    "abstract": abstract,
+                    "user_id": user_id
                 }
             )
         ]
     )
 
 
+# ============================================================
+# PAPER ENDPOINTS (all require login, all scoped to current_user)
+# ============================================================
+
 @app.post("/upload")
-async def upload_paper(file: UploadFile = File(...)):
+async def upload_paper(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     if not file.filename.endswith(".pdf"):
         return {"error": "Only PDF files are allowed"}
 
+    user_id = current_user["user_id"]
     unique_id = str(uuid.uuid4())
     file_path = f"{UPLOAD_DIR}/{unique_id}_{file.filename}"
 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+
+    # Check whether this user already uploaded this exact file before
+    file_hash = calculate_file_hash(file_path)
+    existing_paper = find_existing_paper_by_hash(file_hash, user_id)
+
+    if existing_paper:
+        os.remove(file_path)
+        return {
+            "message": "You have already uploaded this paper.",
+            "existing_paper_id": existing_paper["id"],
+            "existing_paper_title": existing_paper["title"]
+        }
 
     parsed_data = parse_pdf_with_grobid(file_path)
 
@@ -238,19 +391,21 @@ async def upload_paper(file: UploadFile = File(...)):
             "parsed_data": parsed_data
         }
 
-    paper_id = save_paper_to_postgres(unique_id, file.filename, file_path, parsed_data)
+    paper_id = save_paper_to_postgres(unique_id, file.filename, file_path, file_hash, parsed_data, user_id)
 
     create_paper_node_in_neo4j(
         paper_id,
         unique_id,
         parsed_data.get("title"),
-        parsed_data.get("authors", [])
+        parsed_data.get("authors", []),
+        user_id
     )
 
     save_embedding_to_qdrant(
         paper_id,
         parsed_data.get("title", ""),
-        parsed_data.get("abstract", "")
+        parsed_data.get("abstract", ""),
+        user_id
     )
 
     return {
@@ -263,11 +418,15 @@ async def upload_paper(file: UploadFile = File(...)):
 
 
 @app.get("/papers")
-def get_all_papers():
+def get_all_papers(current_user: dict = Depends(get_current_user)):
+    """Returns only the papers belonging to the currently logged-in user"""
     conn = get_postgres_connection()
     cur = conn.cursor()
 
-    cur.execute("SELECT id, unique_id, filename, title, authors, abstract, uploaded_at FROM papers ORDER BY uploaded_at DESC;")
+    cur.execute(
+        "SELECT id, unique_id, filename, title, authors, abstract, uploaded_at FROM papers WHERE user_id = %s ORDER BY uploaded_at DESC;",
+        (current_user["user_id"],)
+    )
     rows = cur.fetchall()
 
     cur.close()
@@ -289,14 +448,17 @@ def get_all_papers():
 
 
 @app.get("/search")
-def semantic_search(query: str, limit: int = 5):
-    """Meaning-based search - converts the query into an embedding and finds similar papers"""
+def semantic_search(query: str, limit: int = 5, current_user: dict = Depends(get_current_user)):
+    """Meaning-based search - only searches within the current user's own papers"""
     query_embedding = embedding_model.encode(query).tolist()
 
     results = qdrant_client.query_points(
         collection_name=QDRANT_COLLECTION,
         query=query_embedding,
-        limit=limit
+        limit=limit,
+        query_filter={
+            "must": [{"key": "user_id", "match": {"value": current_user["user_id"]}}]
+        }
     ).points
 
     search_results = []
@@ -312,21 +474,22 @@ def semantic_search(query: str, limit: int = 5):
 
 
 @app.get("/author-network")
-def get_author_network():
-    """Returns co-authorship network between authors, in a readable, paper-grouped format"""
+def get_author_network(current_user: dict = Depends(get_current_user)):
+    """Returns co-authorship network between authors, scoped to the current user's papers"""
     with neo4j_driver.session() as session:
-        # Get all authors grouped by paper
         paper_result = session.run(
             """
             MATCH (a:Author)-[:AUTHORED]->(p:Paper)
+            WHERE p.user_id = $user_id
             RETURN p.title AS paper_title, p.paper_id AS paper_id, collect(a.name) AS authors
             ORDER BY paper_title
-            """
+            """,
+            user_id=current_user["user_id"]
         )
 
         collaborations_by_paper = []
         for record in paper_result:
-            if len(record["authors"]) > 1:  # Only show multi-author papers (actual collaboration)
+            if len(record["authors"]) > 1:
                 collaborations_by_paper.append({
                     "paper_id": record["paper_id"],
                     "paper_title": record["paper_title"] or "Untitled",
@@ -334,33 +497,34 @@ def get_author_network():
                     "author_count": len(record["authors"])
                 })
 
-        # Top authors (most papers written)
         author_result = session.run(
             """
             MATCH (a:Author)-[:AUTHORED]->(p:Paper)
+            WHERE p.user_id = $user_id
             RETURN a.name AS name, count(p) AS paper_count
             ORDER BY paper_count DESC
             LIMIT 10
-            """
+            """,
+            user_id=current_user["user_id"]
         )
         top_authors = [{"name": r["name"], "paper_count": r["paper_count"]} for r in author_result]
 
-        # Summary stats
         stats_result = session.run(
             """
-            MATCH (a:Author) WITH count(a) AS total_authors
-            MATCH (p:Paper) WITH total_authors, count(p) AS total_papers
-            MATCH ()-[r:AUTHORED]->() 
-            RETURN total_authors, total_papers, count(r) AS total_relationships
-            """
+            MATCH (p:Paper) WHERE p.user_id = $user_id
+            WITH count(p) AS total_papers
+            MATCH (a:Author)-[r:AUTHORED]->(p:Paper) WHERE p.user_id = $user_id
+            RETURN total_papers, count(DISTINCT a) AS total_authors, count(r) AS total_relationships
+            """,
+            user_id=current_user["user_id"]
         )
         stats = stats_result.single()
 
     return {
         "summary": {
-            "total_authors": stats["total_authors"],
-            "total_papers": stats["total_papers"],
-            "total_authorship_links": stats["total_relationships"]
+            "total_authors": stats["total_authors"] if stats else 0,
+            "total_papers": stats["total_papers"] if stats else 0,
+            "total_authorship_links": stats["total_relationships"] if stats else 0
         },
         "top_authors": top_authors,
         "collaborations_by_paper": collaborations_by_paper
@@ -368,8 +532,8 @@ def get_author_network():
 
 
 @app.get("/timeline")
-def get_research_timeline():
-    """Groups papers by upload month and returns timeline data"""
+def get_research_timeline(current_user: dict = Depends(get_current_user)):
+    """Groups the current user's papers by upload month"""
     conn = get_postgres_connection()
     cur = conn.cursor()
 
@@ -380,9 +544,11 @@ def get_research_timeline():
             COUNT(*) AS paper_count,
             ARRAY_AGG(title) AS titles
         FROM papers
+        WHERE user_id = %s
         GROUP BY TO_CHAR(uploaded_at, 'YYYY-MM')
         ORDER BY month ASC;
-        """
+        """,
+        (current_user["user_id"],)
     )
     rows = cur.fetchall()
 
@@ -404,21 +570,22 @@ def get_research_timeline():
 
 
 @app.get("/ask")
-def ask_question(question: str, context_limit: int = 3):
-    """Takes a user question, finds relevant papers, and generates an answer using Gemini"""
+def ask_question(question: str, context_limit: int = 3, current_user: dict = Depends(get_current_user)):
+    """Takes a user question, finds relevant papers (from the current user's own papers), and generates an answer using Gemini"""
 
-    # Step 1: Find relevant papers (same approach as /search)
     query_embedding = embedding_model.encode(question).tolist()
     results = qdrant_client.query_points(
         collection_name=QDRANT_COLLECTION,
         query=query_embedding,
-        limit=context_limit
+        limit=context_limit,
+        query_filter={
+            "must": [{"key": "user_id", "match": {"value": current_user["user_id"]}}]
+        }
     ).points
 
     if not results:
         return {"question": question, "answer": "No relevant paper was found.", "sources": []}
 
-    # Step 2: Build context from those papers' abstracts
     context_text = ""
     sources = []
     for r in results:
@@ -427,7 +594,6 @@ def ask_question(question: str, context_limit: int = 3):
         context_text += f"\n\nPaper Title: {title}\nAbstract: {abstract}"
         sources.append({"paper_id": r.id, "title": title, "score": r.score})
 
-    # Step 3: Send the prompt to Gemini
     prompt = f"""Answer the question below using only the research paper abstracts provided as context.
 Only answer from the given context. If the answer is not present in the context, say "The answer to this question was not found in the given context."
 
@@ -448,22 +614,25 @@ Answer:"""
         "answer": response.text,
         "sources": sources
     }
-@app.get("/literature-review")
-def generate_literature_review(topic: str, paper_limit: int = 8):
-    """Generates a structured literature review on a given topic using the uploaded papers"""
 
-    # Step 1: Find relevant papers on this topic
+
+@app.get("/literature-review")
+def generate_literature_review(topic: str, paper_limit: int = 8, current_user: dict = Depends(get_current_user)):
+    """Generates a structured literature review on a given topic using the current user's own papers"""
+
     query_embedding = embedding_model.encode(topic).tolist()
     results = qdrant_client.query_points(
         collection_name=QDRANT_COLLECTION,
         query=query_embedding,
-        limit=paper_limit
+        limit=paper_limit,
+        query_filter={
+            "must": [{"key": "user_id", "match": {"value": current_user["user_id"]}}]
+        }
     ).points
 
     if not results:
         return {"topic": topic, "review": "No relevant papers were found for this topic.", "sources": []}
 
-    # Step 2: Build context from all relevant papers
     context_text = ""
     sources = []
     for r in results:
@@ -472,7 +641,6 @@ def generate_literature_review(topic: str, paper_limit: int = 8):
         context_text += f"\n\nPaper Title: {title}\nAbstract: {abstract}"
         sources.append({"paper_id": r.id, "title": title, "score": r.score})
 
-    # Step 3: Ask Gemini to write a structured literature review
     prompt = f"""You are a research assistant. Using ONLY the paper abstracts provided below, write a structured literature review on the topic: "{topic}"
 
 Structure your review with these sections:
@@ -497,4 +665,52 @@ Write the literature review now:"""
         "review": response.text,
         "papers_used": len(sources),
         "sources": sources
+    }
+
+
+@app.get("/recommend-citations")
+def recommend_citations(paper_id: int, limit: int = 5, current_user: dict = Depends(get_current_user)):
+    """Given a paper already in the system (owned by the current user), recommends other similar papers"""
+
+    stored_points = qdrant_client.retrieve(
+        collection_name=QDRANT_COLLECTION,
+        ids=[paper_id],
+        with_vectors=True
+    )
+
+    if not stored_points:
+        return {"error": f"No paper found with paper_id {paper_id}"}
+
+    source_paper = stored_points[0]
+
+    if source_paper.payload.get("user_id") != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="You do not have access to this paper")
+
+    source_vector = source_paper.vector
+
+    results = qdrant_client.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=source_vector,
+        limit=limit + 1,
+        query_filter={
+            "must": [{"key": "user_id", "match": {"value": current_user["user_id"]}}]
+        }
+    ).points
+
+    recommendations = []
+    for r in results:
+        if r.id != paper_id:
+            recommendations.append({
+                "paper_id": r.id,
+                "score": r.score,
+                "title": r.payload.get("title"),
+                "abstract": r.payload.get("abstract")
+            })
+
+    return {
+        "source_paper": {
+            "paper_id": paper_id,
+            "title": source_paper.payload.get("title")
+        },
+        "recommended_citations": recommendations[:limit]
     }
