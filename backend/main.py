@@ -309,48 +309,55 @@ def semantic_search(query: str, limit: int = 5):
 
 @app.get("/author-network")
 def get_author_network():
-    """Authors ke beech co-authorship network return karta hai (graph visualization ke liye)"""
+    """Authors ke beech co-authorship network — readable, paper-wise grouped format me"""
     with neo4j_driver.session() as session:
-        # Saare co-authorship pairs nikaalo
-        result = session.run(
-            """
-            MATCH (a1:Author)-[:AUTHORED]->(p:Paper)<-[:AUTHORED]-(a2:Author)
-            WHERE a1.name < a2.name
-            RETURN a1.name AS author1, a2.name AS author2, p.title AS paper_title, p.paper_id AS paper_id
-            """
-        )
-
-        edges = []
-        authors_set = set()
-
-        for record in result:
-            edges.append({
-                "source": record["author1"],
-                "target": record["author2"],
-                "paper_title": record["paper_title"],
-                "paper_id": record["paper_id"]
-            })
-            authors_set.add(record["author1"])
-            authors_set.add(record["author2"])
-
-        # Har author ka paper count bhi nikaalo
-        count_result = session.run(
+        # Har paper ke saare authors nikaalo (grouped)
+        paper_result = session.run(
             """
             MATCH (a:Author)-[:AUTHORED]->(p:Paper)
-            RETURN a.name AS author, count(p) AS paper_count
+            RETURN p.title AS paper_title, p.paper_id AS paper_id, collect(a.name) AS authors
+            ORDER BY paper_title
             """
         )
 
-        paper_counts = {record["author"]: record["paper_count"] for record in count_result}
+        collaborations_by_paper = []
+        for record in paper_result:
+            if len(record["authors"]) > 1:  # Sirf multi-author papers dikhao (collaboration hai)
+                collaborations_by_paper.append({
+                    "paper_id": record["paper_id"],
+                    "paper_title": record["paper_title"] or "Untitled",
+                    "authors": record["authors"],
+                    "author_count": len(record["authors"])
+                })
 
-        nodes = [
-            {"id": author, "paper_count": paper_counts.get(author, 0)}
-            for author in authors_set
-        ]
+        # Top authors (sabse zyada papers likhne wale)
+        author_result = session.run(
+            """
+            MATCH (a:Author)-[:AUTHORED]->(p:Paper)
+            RETURN a.name AS name, count(p) AS paper_count
+            ORDER BY paper_count DESC
+            LIMIT 10
+            """
+        )
+        top_authors = [{"name": r["name"], "paper_count": r["paper_count"]} for r in author_result]
+
+        # Summary stats
+        stats_result = session.run(
+            """
+            MATCH (a:Author) WITH count(a) AS total_authors
+            MATCH (p:Paper) WITH total_authors, count(p) AS total_papers
+            MATCH ()-[r:AUTHORED]->() 
+            RETURN total_authors, total_papers, count(r) AS total_relationships
+            """
+        )
+        stats = stats_result.single()
 
     return {
-        "nodes": nodes,
-        "edges": edges,
-        "total_authors": len(nodes),
-        "total_collaborations": len(edges)
+        "summary": {
+            "total_authors": stats["total_authors"],
+            "total_papers": stats["total_papers"],
+            "total_authorship_links": stats["total_relationships"]
+        },
+        "top_authors": top_authors,
+        "collaborations_by_paper": collaborations_by_paper
     }
