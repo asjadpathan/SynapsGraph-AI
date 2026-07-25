@@ -33,7 +33,6 @@ qdrant_client = QdrantClient(
 )
 
 # Embedding model ek hi baar load karte hain (server start hote waqt)
-# Ye pehli baar chalne pe model download karega (internet chahiye hoga, phir offline chalega)
 print("Loading embedding model... (pehli baar thoda time lagega)")
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 print("Embedding model loaded!")
@@ -244,7 +243,6 @@ async def upload_paper(file: UploadFile = File(...)):
         parsed_data.get("authors", [])
     )
 
-    # Qdrant me embedding save karo
     save_embedding_to_qdrant(
         paper_id,
         parsed_data.get("title", ""),
@@ -307,3 +305,52 @@ def semantic_search(query: str, limit: int = 5):
         })
 
     return {"query": query, "results": search_results}
+
+
+@app.get("/author-network")
+def get_author_network():
+    """Authors ke beech co-authorship network return karta hai (graph visualization ke liye)"""
+    with neo4j_driver.session() as session:
+        # Saare co-authorship pairs nikaalo
+        result = session.run(
+            """
+            MATCH (a1:Author)-[:AUTHORED]->(p:Paper)<-[:AUTHORED]-(a2:Author)
+            WHERE a1.name < a2.name
+            RETURN a1.name AS author1, a2.name AS author2, p.title AS paper_title, p.paper_id AS paper_id
+            """
+        )
+
+        edges = []
+        authors_set = set()
+
+        for record in result:
+            edges.append({
+                "source": record["author1"],
+                "target": record["author2"],
+                "paper_title": record["paper_title"],
+                "paper_id": record["paper_id"]
+            })
+            authors_set.add(record["author1"])
+            authors_set.add(record["author2"])
+
+        # Har author ka paper count bhi nikaalo
+        count_result = session.run(
+            """
+            MATCH (a:Author)-[:AUTHORED]->(p:Paper)
+            RETURN a.name AS author, count(p) AS paper_count
+            """
+        )
+
+        paper_counts = {record["author"]: record["paper_count"] for record in count_result}
+
+        nodes = [
+            {"id": author, "paper_count": paper_counts.get(author, 0)}
+            for author in authors_set
+        ]
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "total_authors": len(nodes),
+        "total_collaborations": len(edges)
+    }
