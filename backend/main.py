@@ -448,3 +448,53 @@ Answer:"""
         "answer": response.text,
         "sources": sources
     }
+@app.get("/literature-review")
+def generate_literature_review(topic: str, paper_limit: int = 8):
+    """Generates a structured literature review on a given topic using the uploaded papers"""
+
+    # Step 1: Find relevant papers on this topic
+    query_embedding = embedding_model.encode(topic).tolist()
+    results = qdrant_client.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=query_embedding,
+        limit=paper_limit
+    ).points
+
+    if not results:
+        return {"topic": topic, "review": "No relevant papers were found for this topic.", "sources": []}
+
+    # Step 2: Build context from all relevant papers
+    context_text = ""
+    sources = []
+    for r in results:
+        title = r.payload.get("title", "Unknown")
+        abstract = r.payload.get("abstract", "")
+        context_text += f"\n\nPaper Title: {title}\nAbstract: {abstract}"
+        sources.append({"paper_id": r.id, "title": title, "score": r.score})
+
+    # Step 3: Ask Gemini to write a structured literature review
+    prompt = f"""You are a research assistant. Using ONLY the paper abstracts provided below, write a structured literature review on the topic: "{topic}"
+
+Structure your review with these sections:
+1. Introduction - briefly introduce the topic and why it matters
+2. Key Themes - summarize the main approaches/methods found across the papers
+3. Common Findings - what results or conclusions do multiple papers agree on
+4. Research Gaps - based on what's missing or under-explored across these papers, suggest potential gaps
+5. Conclusion - a short wrap-up
+
+Papers:
+{context_text}
+
+Write the literature review now:"""
+
+    response = gemini_client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt
+    )
+
+    return {
+        "topic": topic,
+        "review": response.text,
+        "papers_used": len(sources),
+        "sources": sources
+    }
