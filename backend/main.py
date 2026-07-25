@@ -8,6 +8,8 @@ import xml.etree.ElementTree as ET
 import psycopg2
 from neo4j import GraphDatabase
 from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+from sentence_transformers import SentenceTransformer
 import redis
 
 load_dotenv()
@@ -16,12 +18,34 @@ app = FastAPI(title="Research Paper Discovery Platform")
 
 UPLOAD_DIR = "uploads"
 GROBID_URL = os.getenv("GROBID_URL")
+QDRANT_COLLECTION = "papers"
 
 # Neo4j driver ek hi baar banate hain, poori app ke liye reuse hoga
 neo4j_driver = GraphDatabase.driver(
     os.getenv("NEO4J_URI"),
     auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD"))
 )
+
+# Qdrant client ek hi baar banate hain
+qdrant_client = QdrantClient(
+    host=os.getenv("QDRANT_HOST"),
+    port=int(os.getenv("QDRANT_PORT"))
+)
+
+# Embedding model ek hi baar load karte hain (server start hote waqt)
+# Ye pehli baar chalne pe model download karega (internet chahiye hoga, phir offline chalega)
+print("Loading embedding model... (pehli baar thoda time lagega)")
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+print("Embedding model loaded!")
+
+# Qdrant me collection banao agar already nahi hai
+try:
+    qdrant_client.get_collection(QDRANT_COLLECTION)
+except Exception:
+    qdrant_client.create_collection(
+        collection_name=QDRANT_COLLECTION,
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+    )
 
 
 def get_postgres_connection():
@@ -57,11 +81,7 @@ def health_check():
         status["neo4j"] = f"error: {str(e)}"
 
     try:
-        client = QdrantClient(
-            host=os.getenv("QDRANT_HOST"),
-            port=int(os.getenv("QDRANT_PORT"))
-        )
-        client.get_collections()
+        qdrant_client.get_collections()
         status["qdrant"] = "connected"
     except Exception as e:
         status["qdrant"] = f"error: {str(e)}"
@@ -150,7 +170,6 @@ def save_paper_to_postgres(unique_id, filename, file_path, parsed_data):
 def create_paper_node_in_neo4j(paper_id, unique_id, title, authors):
     """Neo4j me ek Paper node banata hai, aur har author ke liye Author node + relationship banata hai"""
     with neo4j_driver.session() as session:
-        # Paper node banao
         session.run(
             """
             MERGE (p:Paper {paper_id: $paper_id})
@@ -162,7 +181,6 @@ def create_paper_node_in_neo4j(paper_id, unique_id, title, authors):
             title=title
         )
 
-        # Har author ke liye Author node banao aur Paper se link karo
         for author_name in authors:
             session.run(
                 """
@@ -174,6 +192,26 @@ def create_paper_node_in_neo4j(paper_id, unique_id, title, authors):
                 author_name=author_name,
                 paper_id=paper_id
             )
+
+
+def save_embedding_to_qdrant(paper_id, title, abstract):
+    """Paper ke title+abstract ka embedding banata hai aur Qdrant me save karta hai"""
+    text_to_embed = f"{title}. {abstract}"
+    embedding = embedding_model.encode(text_to_embed).tolist()
+
+    qdrant_client.upsert(
+        collection_name=QDRANT_COLLECTION,
+        points=[
+            PointStruct(
+                id=paper_id,
+                vector=embedding,
+                payload={
+                    "title": title,
+                    "abstract": abstract
+                }
+            )
+        ]
+    )
 
 
 @app.post("/upload")
@@ -199,7 +237,6 @@ async def upload_paper(file: UploadFile = File(...)):
 
     paper_id = save_paper_to_postgres(unique_id, file.filename, file_path, parsed_data)
 
-    # Neo4j me bhi node banao
     create_paper_node_in_neo4j(
         paper_id,
         unique_id,
@@ -207,8 +244,15 @@ async def upload_paper(file: UploadFile = File(...)):
         parsed_data.get("authors", [])
     )
 
+    # Qdrant me embedding save karo
+    save_embedding_to_qdrant(
+        paper_id,
+        parsed_data.get("title", ""),
+        parsed_data.get("abstract", "")
+    )
+
     return {
-        "message": "File uploaded, parsed, saved, and added to knowledge graph",
+        "message": "File uploaded, parsed, saved, added to knowledge graph, and indexed for search",
         "paper_id": paper_id,
         "filename": file.filename,
         "saved_as": file_path,
@@ -240,3 +284,26 @@ def get_all_papers():
         })
 
     return {"papers": papers}
+
+
+@app.get("/search")
+def semantic_search(query: str, limit: int = 5):
+    """Meaning-based search — query ko embedding me convert karke similar papers dhoondta hai"""
+    query_embedding = embedding_model.encode(query).tolist()
+
+    results = qdrant_client.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=query_embedding,
+        limit=limit
+    ).points
+
+    search_results = []
+    for r in results:
+        search_results.append({
+            "paper_id": r.id,
+            "score": r.score,
+            "title": r.payload.get("title"),
+            "abstract": r.payload.get("abstract")
+        })
+
+    return {"query": query, "results": search_results}
