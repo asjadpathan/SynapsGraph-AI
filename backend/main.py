@@ -714,3 +714,58 @@ def recommend_citations(paper_id: int, limit: int = 5, current_user: dict = Depe
         },
         "recommended_citations": recommendations[:limit]
     }
+@app.get("/research-gaps")
+def detect_research_gaps(current_user: dict = Depends(get_current_user)):
+    """Analyzes all of the current user's papers together and identifies potential research gaps"""
+
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT title, abstract FROM papers WHERE user_id = %s AND title IS NOT NULL;",
+        (current_user["user_id"],)
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if len(rows) < 2:
+        return {
+            "message": "Not enough papers to detect meaningful research gaps. Upload at least 2-3 papers on a related topic first.",
+            "gaps": None
+        }
+
+    # Build context from all papers
+    context_text = ""
+    paper_titles = []
+    for title, abstract in rows:
+        context_text += f"\n\nPaper Title: {title}\nAbstract: {abstract}"
+        paper_titles.append(title)
+
+    prompt = f"""You are a research analyst. Below are the titles and abstracts of {len(rows)} research papers collected by a researcher.
+
+Analyze these papers TOGETHER as a collection and identify potential RESEARCH GAPS - meaning:
+- Topics, methods, or combinations that appear under-explored across these papers
+- Limitations that multiple papers share in common
+- Directions that seem like natural next steps but haven't been covered
+- Missing comparisons or datasets that could strengthen this body of work
+
+Structure your response as:
+1. Summary of the Collection - what this set of papers is broadly about
+2. Identified Research Gaps - a numbered list of specific, actionable gaps
+3. Suggested Future Directions - brief suggestions on what could be explored next
+
+Papers:
+{context_text}
+
+Provide your analysis now:"""
+
+    response = gemini_client.models.generate_content(
+        model="gemini-3.6-flash",
+        contents=prompt
+    )
+
+    return {
+        "papers_analyzed": len(rows),
+        "paper_titles": paper_titles,
+        "gap_analysis": response.text
+    }
