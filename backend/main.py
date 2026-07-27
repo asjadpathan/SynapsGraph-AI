@@ -124,7 +124,6 @@ def signup(request: SignupRequest):
     conn = get_postgres_connection()
     cur = conn.cursor()
 
-    # Check if username or email is already taken
     cur.execute("SELECT id FROM users WHERE username = %s OR email = %s;", (request.username, request.email))
     if cur.fetchone():
         cur.close()
@@ -162,6 +161,85 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user_id, username, _ = row
     token = create_access_token(user_id, username)
     return {"access_token": token, "token_type": "bearer"}
+
+
+# ============================================================
+# PROJECT ENDPOINTS
+# ============================================================
+
+class ProjectCreateRequest(BaseModel):
+    name: str
+    description: str = ""
+
+
+@app.post("/projects")
+def create_project(request: ProjectCreateRequest, current_user: dict = Depends(get_current_user)):
+    """Creates a new project (workspace) for the current user"""
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        "INSERT INTO projects (user_id, name, description) VALUES (%s, %s, %s) RETURNING id, created_at;",
+        (current_user["user_id"], request.name, request.description)
+    )
+    project_id, created_at = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {
+        "message": "Project created successfully",
+        "project_id": project_id,
+        "name": request.name,
+        "description": request.description,
+        "created_at": str(created_at)
+    }
+
+
+@app.get("/projects")
+def list_projects(current_user: dict = Depends(get_current_user)):
+    """Lists all projects belonging to the current user, along with how many papers each one has"""
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT pr.id, pr.name, pr.description, pr.created_at, COUNT(p.id) AS paper_count
+        FROM projects pr
+        LEFT JOIN papers p ON p.project_id = pr.id
+        WHERE pr.user_id = %s
+        GROUP BY pr.id
+        ORDER BY pr.created_at DESC;
+        """,
+        (current_user["user_id"],)
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    projects = []
+    for row in rows:
+        projects.append({
+            "project_id": row[0],
+            "name": row[1],
+            "description": row[2],
+            "created_at": str(row[3]),
+            "paper_count": row[4]
+        })
+
+    return {"projects": projects}
+
+
+def verify_project_ownership(project_id: int, user_id: int):
+    """Checks that the given project exists and belongs to this user. Raises an error otherwise."""
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM projects WHERE id = %s AND user_id = %s;", (project_id, user_id))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found or you do not have access to it")
 
 
 # ============================================================
@@ -218,11 +296,11 @@ def calculate_file_hash(file_path: str) -> str:
     return sha256_hash.hexdigest()
 
 
-def find_existing_paper_by_hash(file_hash: str, user_id: int):
-    """Checks if this user already uploaded a paper with this exact file hash"""
+def find_existing_paper_by_hash(file_hash: str, project_id: int):
+    """Checks if this project already has a paper with this exact file hash"""
     conn = get_postgres_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, title FROM papers WHERE file_hash = %s AND user_id = %s;", (file_hash, user_id))
+    cur.execute("SELECT id, title FROM papers WHERE file_hash = %s AND project_id = %s;", (file_hash, project_id))
     row = cur.fetchone()
     cur.close()
     conn.close()
@@ -271,14 +349,14 @@ def parse_pdf_with_grobid(file_path: str):
     }
 
 
-def save_paper_to_postgres(unique_id, filename, file_path, file_hash, parsed_data, user_id):
+def save_paper_to_postgres(unique_id, filename, file_path, file_hash, parsed_data, user_id, project_id):
     conn = get_postgres_connection()
     cur = conn.cursor()
 
     cur.execute(
         """
-        INSERT INTO papers (unique_id, filename, file_path, file_hash, title, authors, abstract, user_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO papers (unique_id, filename, file_path, file_hash, title, authors, abstract, user_id, project_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id;
         """,
         (
@@ -290,6 +368,7 @@ def save_paper_to_postgres(unique_id, filename, file_path, file_hash, parsed_dat
             parsed_data.get("authors"),
             parsed_data.get("abstract"),
             user_id,
+            project_id,
         )
     )
 
@@ -301,21 +380,23 @@ def save_paper_to_postgres(unique_id, filename, file_path, file_hash, parsed_dat
     return paper_id
 
 
-def create_paper_node_in_neo4j(paper_id, unique_id, title, authors, user_id):
+def create_paper_node_in_neo4j(paper_id, unique_id, title, authors, user_id, project_id):
     """Creates a Paper node in Neo4j, and an Author node + relationship for each author.
-    The Paper node also stores which user owns it."""
+    The Paper node stores which user and project it belongs to."""
     with neo4j_driver.session() as session:
         session.run(
             """
             MERGE (p:Paper {paper_id: $paper_id})
             SET p.unique_id = $unique_id,
                 p.title = $title,
-                p.user_id = $user_id
+                p.user_id = $user_id,
+                p.project_id = $project_id
             """,
             paper_id=paper_id,
             unique_id=unique_id,
             title=title,
-            user_id=user_id
+            user_id=user_id,
+            project_id=project_id
         )
 
         for author_name in authors:
@@ -331,9 +412,9 @@ def create_paper_node_in_neo4j(paper_id, unique_id, title, authors, user_id):
             )
 
 
-def save_embedding_to_qdrant(paper_id, title, abstract, user_id):
+def save_embedding_to_qdrant(paper_id, title, abstract, user_id, project_id):
     """Generates an embedding for the paper's title+abstract and saves it in Qdrant,
-    tagged with the owning user's id so searches can be scoped per user."""
+    tagged with the owning user and project so searches can be scoped correctly."""
     text_to_embed = f"{title}. {abstract}"
     embedding = embedding_model.encode(text_to_embed).tolist()
 
@@ -346,37 +427,49 @@ def save_embedding_to_qdrant(paper_id, title, abstract, user_id):
                 payload={
                     "title": title,
                     "abstract": abstract,
-                    "user_id": user_id
+                    "user_id": user_id,
+                    "project_id": project_id
                 }
             )
         ]
     )
 
 
+def build_project_filter(user_id: int, project_id: int):
+    """Builds a Qdrant filter that scopes results to a specific user's specific project"""
+    return {
+        "must": [
+            {"key": "user_id", "match": {"value": user_id}},
+            {"key": "project_id", "match": {"value": project_id}}
+        ]
+    }
+
+
 # ============================================================
-# PAPER ENDPOINTS (all require login, all scoped to current_user)
+# PAPER ENDPOINTS (all require login AND a project_id)
 # ============================================================
 
 @app.post("/upload")
-async def upload_paper(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+async def upload_paper(project_id: int, file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
     if not file.filename.endswith(".pdf"):
         return {"error": "Only PDF files are allowed"}
 
     user_id = current_user["user_id"]
+    verify_project_ownership(project_id, user_id)
+
     unique_id = str(uuid.uuid4())
     file_path = f"{UPLOAD_DIR}/{unique_id}_{file.filename}"
 
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Check whether this user already uploaded this exact file before
     file_hash = calculate_file_hash(file_path)
-    existing_paper = find_existing_paper_by_hash(file_hash, user_id)
+    existing_paper = find_existing_paper_by_hash(file_hash, project_id)
 
     if existing_paper:
         os.remove(file_path)
         return {
-            "message": "You have already uploaded this paper.",
+            "message": "This paper has already been uploaded to this project.",
             "existing_paper_id": existing_paper["id"],
             "existing_paper_title": existing_paper["title"]
         }
@@ -391,26 +484,29 @@ async def upload_paper(file: UploadFile = File(...), current_user: dict = Depend
             "parsed_data": parsed_data
         }
 
-    paper_id = save_paper_to_postgres(unique_id, file.filename, file_path, file_hash, parsed_data, user_id)
+    paper_id = save_paper_to_postgres(unique_id, file.filename, file_path, file_hash, parsed_data, user_id, project_id)
 
     create_paper_node_in_neo4j(
         paper_id,
         unique_id,
         parsed_data.get("title"),
         parsed_data.get("authors", []),
-        user_id
+        user_id,
+        project_id
     )
 
     save_embedding_to_qdrant(
         paper_id,
         parsed_data.get("title", ""),
         parsed_data.get("abstract", ""),
-        user_id
+        user_id,
+        project_id
     )
 
     return {
         "message": "File uploaded, parsed, saved, added to knowledge graph, and indexed for search",
         "paper_id": paper_id,
+        "project_id": project_id,
         "filename": file.filename,
         "saved_as": file_path,
         "parsed_data": parsed_data
@@ -418,14 +514,16 @@ async def upload_paper(file: UploadFile = File(...), current_user: dict = Depend
 
 
 @app.get("/papers")
-def get_all_papers(current_user: dict = Depends(get_current_user)):
-    """Returns only the papers belonging to the currently logged-in user"""
+def get_all_papers(project_id: int, current_user: dict = Depends(get_current_user)):
+    """Returns only the papers belonging to the given project (owned by the current user)"""
+    verify_project_ownership(project_id, current_user["user_id"])
+
     conn = get_postgres_connection()
     cur = conn.cursor()
 
     cur.execute(
-        "SELECT id, unique_id, filename, title, authors, abstract, uploaded_at FROM papers WHERE user_id = %s ORDER BY uploaded_at DESC;",
-        (current_user["user_id"],)
+        "SELECT id, unique_id, filename, title, authors, abstract, uploaded_at FROM papers WHERE project_id = %s ORDER BY uploaded_at DESC;",
+        (project_id,)
     )
     rows = cur.fetchall()
 
@@ -448,17 +546,17 @@ def get_all_papers(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/search")
-def semantic_search(query: str, limit: int = 5, current_user: dict = Depends(get_current_user)):
-    """Meaning-based search - only searches within the current user's own papers"""
+def semantic_search(query: str, project_id: int, limit: int = 5, current_user: dict = Depends(get_current_user)):
+    """Meaning-based search - only searches within the given project"""
+    verify_project_ownership(project_id, current_user["user_id"])
+
     query_embedding = embedding_model.encode(query).tolist()
 
     results = qdrant_client.query_points(
         collection_name=QDRANT_COLLECTION,
         query=query_embedding,
         limit=limit,
-        query_filter={
-            "must": [{"key": "user_id", "match": {"value": current_user["user_id"]}}]
-        }
+        query_filter=build_project_filter(current_user["user_id"], project_id)
     ).points
 
     search_results = []
@@ -474,17 +572,19 @@ def semantic_search(query: str, limit: int = 5, current_user: dict = Depends(get
 
 
 @app.get("/author-network")
-def get_author_network(current_user: dict = Depends(get_current_user)):
-    """Returns co-authorship network between authors, scoped to the current user's papers"""
+def get_author_network(project_id: int, current_user: dict = Depends(get_current_user)):
+    """Returns co-authorship network between authors, scoped to the given project"""
+    verify_project_ownership(project_id, current_user["user_id"])
+
     with neo4j_driver.session() as session:
         paper_result = session.run(
             """
             MATCH (a:Author)-[:AUTHORED]->(p:Paper)
-            WHERE p.user_id = $user_id
+            WHERE p.project_id = $project_id
             RETURN p.title AS paper_title, p.paper_id AS paper_id, collect(a.name) AS authors
             ORDER BY paper_title
             """,
-            user_id=current_user["user_id"]
+            project_id=project_id
         )
 
         collaborations_by_paper = []
@@ -500,23 +600,23 @@ def get_author_network(current_user: dict = Depends(get_current_user)):
         author_result = session.run(
             """
             MATCH (a:Author)-[:AUTHORED]->(p:Paper)
-            WHERE p.user_id = $user_id
+            WHERE p.project_id = $project_id
             RETURN a.name AS name, count(p) AS paper_count
             ORDER BY paper_count DESC
             LIMIT 10
             """,
-            user_id=current_user["user_id"]
+            project_id=project_id
         )
         top_authors = [{"name": r["name"], "paper_count": r["paper_count"]} for r in author_result]
 
         stats_result = session.run(
             """
-            MATCH (p:Paper) WHERE p.user_id = $user_id
+            MATCH (p:Paper) WHERE p.project_id = $project_id
             WITH count(p) AS total_papers
-            MATCH (a:Author)-[r:AUTHORED]->(p:Paper) WHERE p.user_id = $user_id
+            MATCH (a:Author)-[r:AUTHORED]->(p:Paper) WHERE p.project_id = $project_id
             RETURN total_papers, count(DISTINCT a) AS total_authors, count(r) AS total_relationships
             """,
-            user_id=current_user["user_id"]
+            project_id=project_id
         )
         stats = stats_result.single()
 
@@ -532,8 +632,10 @@ def get_author_network(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/timeline")
-def get_research_timeline(current_user: dict = Depends(get_current_user)):
-    """Groups the current user's papers by upload month"""
+def get_research_timeline(project_id: int, current_user: dict = Depends(get_current_user)):
+    """Groups the given project's papers by upload month"""
+    verify_project_ownership(project_id, current_user["user_id"])
+
     conn = get_postgres_connection()
     cur = conn.cursor()
 
@@ -544,11 +646,11 @@ def get_research_timeline(current_user: dict = Depends(get_current_user)):
             COUNT(*) AS paper_count,
             ARRAY_AGG(title) AS titles
         FROM papers
-        WHERE user_id = %s
+        WHERE project_id = %s
         GROUP BY TO_CHAR(uploaded_at, 'YYYY-MM')
         ORDER BY month ASC;
         """,
-        (current_user["user_id"],)
+        (project_id,)
     )
     rows = cur.fetchall()
 
@@ -570,17 +672,16 @@ def get_research_timeline(current_user: dict = Depends(get_current_user)):
 
 
 @app.get("/ask")
-def ask_question(question: str, context_limit: int = 3, current_user: dict = Depends(get_current_user)):
-    """Takes a user question, finds relevant papers (from the current user's own papers), and generates an answer using Gemini"""
+def ask_question(question: str, project_id: int, context_limit: int = 3, current_user: dict = Depends(get_current_user)):
+    """Takes a user question, finds relevant papers (from the given project), and generates an answer using Gemini"""
+    verify_project_ownership(project_id, current_user["user_id"])
 
     query_embedding = embedding_model.encode(question).tolist()
     results = qdrant_client.query_points(
         collection_name=QDRANT_COLLECTION,
         query=query_embedding,
         limit=context_limit,
-        query_filter={
-            "must": [{"key": "user_id", "match": {"value": current_user["user_id"]}}]
-        }
+        query_filter=build_project_filter(current_user["user_id"], project_id)
     ).points
 
     if not results:
@@ -617,17 +718,16 @@ Answer:"""
 
 
 @app.get("/literature-review")
-def generate_literature_review(topic: str, paper_limit: int = 8, current_user: dict = Depends(get_current_user)):
-    """Generates a structured literature review on a given topic using the current user's own papers"""
+def generate_literature_review(topic: str, project_id: int, paper_limit: int = 8, current_user: dict = Depends(get_current_user)):
+    """Generates a structured literature review on a given topic using the given project's papers"""
+    verify_project_ownership(project_id, current_user["user_id"])
 
     query_embedding = embedding_model.encode(topic).tolist()
     results = qdrant_client.query_points(
         collection_name=QDRANT_COLLECTION,
         query=query_embedding,
         limit=paper_limit,
-        query_filter={
-            "must": [{"key": "user_id", "match": {"value": current_user["user_id"]}}]
-        }
+        query_filter=build_project_filter(current_user["user_id"], project_id)
     ).points
 
     if not results:
@@ -669,8 +769,9 @@ Write the literature review now:"""
 
 
 @app.get("/recommend-citations")
-def recommend_citations(paper_id: int, limit: int = 5, current_user: dict = Depends(get_current_user)):
-    """Given a paper already in the system (owned by the current user), recommends other similar papers"""
+def recommend_citations(paper_id: int, project_id: int, limit: int = 5, current_user: dict = Depends(get_current_user)):
+    """Given a paper already in the given project, recommends other similar papers from that same project"""
+    verify_project_ownership(project_id, current_user["user_id"])
 
     stored_points = qdrant_client.retrieve(
         collection_name=QDRANT_COLLECTION,
@@ -683,7 +784,7 @@ def recommend_citations(paper_id: int, limit: int = 5, current_user: dict = Depe
 
     source_paper = stored_points[0]
 
-    if source_paper.payload.get("user_id") != current_user["user_id"]:
+    if source_paper.payload.get("user_id") != current_user["user_id"] or source_paper.payload.get("project_id") != project_id:
         raise HTTPException(status_code=403, detail="You do not have access to this paper")
 
     source_vector = source_paper.vector
@@ -692,9 +793,7 @@ def recommend_citations(paper_id: int, limit: int = 5, current_user: dict = Depe
         collection_name=QDRANT_COLLECTION,
         query=source_vector,
         limit=limit + 1,
-        query_filter={
-            "must": [{"key": "user_id", "match": {"value": current_user["user_id"]}}]
-        }
+        query_filter=build_project_filter(current_user["user_id"], project_id)
     ).points
 
     recommendations = []
@@ -714,15 +813,18 @@ def recommend_citations(paper_id: int, limit: int = 5, current_user: dict = Depe
         },
         "recommended_citations": recommendations[:limit]
     }
+
+
 @app.get("/research-gaps")
-def detect_research_gaps(current_user: dict = Depends(get_current_user)):
-    """Analyzes all of the current user's papers together and identifies potential research gaps"""
+def detect_research_gaps(project_id: int, current_user: dict = Depends(get_current_user)):
+    """Analyzes all of the given project's papers together and identifies potential research gaps"""
+    verify_project_ownership(project_id, current_user["user_id"])
 
     conn = get_postgres_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT title, abstract FROM papers WHERE user_id = %s AND title IS NOT NULL;",
-        (current_user["user_id"],)
+        "SELECT title, abstract FROM papers WHERE project_id = %s AND title IS NOT NULL;",
+        (project_id,)
     )
     rows = cur.fetchall()
     cur.close()
@@ -734,7 +836,6 @@ def detect_research_gaps(current_user: dict = Depends(get_current_user)):
             "gaps": None
         }
 
-    # Build context from all papers
     context_text = ""
     paper_titles = []
     for title, abstract in rows:
