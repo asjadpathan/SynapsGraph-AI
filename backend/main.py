@@ -17,6 +17,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
 from google import genai
+from google.genai.errors import ClientError, ServerError
 import redis
 
 load_dotenv()
@@ -705,10 +706,23 @@ Question: {question}
 
 Answer:"""
 
-    response = gemini_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=prompt
-    )
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt
+        )
+
+    except ClientError:
+        raise HTTPException(
+            status_code=429,
+            detail="Gemini API quota exceeded. Please try again later."
+        )
+
+    except ServerError:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini is temporarily busy. Please try again in a few seconds."
+        )
 
     return {
         "question": question,
@@ -755,10 +769,23 @@ Papers:
 
 Write the literature review now:"""
 
-    response = gemini_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=prompt
-    )
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt
+        )
+
+    except ClientError:
+        raise HTTPException(
+            status_code=429,
+            detail="Gemini API quota exceeded. Please try again later."
+        )
+
+    except ServerError:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini is temporarily busy. Please try again in a few seconds."
+        )
 
     return {
         "topic": topic,
@@ -860,10 +887,23 @@ Papers:
 
 Provide your analysis now:"""
 
-    response = gemini_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=prompt
-    )
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt
+        )
+
+    except ClientError:
+        raise HTTPException(
+            status_code=429,
+            detail="Gemini API quota exceeded. Please try again later."
+        )
+
+    except ServerError:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini is temporarily busy. Please try again in a few seconds."
+        )
 
     return {
         "papers_analyzed": len(rows),
