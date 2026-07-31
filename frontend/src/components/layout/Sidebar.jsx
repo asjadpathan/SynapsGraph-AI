@@ -16,7 +16,8 @@ import {
   Settings, 
   LogOut,
   ChevronRight,
-  Brain
+  Brain,
+  Table
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 
@@ -24,6 +25,7 @@ export const MENU_ITEMS = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'workspace', label: 'Workspace', icon: FolderKanban },
   { id: 'papers', label: 'Research Papers', icon: FileText },
+  { id: 'comparison-table', label: 'Comparison Table', icon: Table },
   { id: 'upload', label: 'Upload Papers', icon: UploadCloud },
   { id: 'semantic-search', label: 'Semantic Search', icon: Search },
   { id: 'knowledge-graph', label: 'Knowledge Graph', icon: Network },

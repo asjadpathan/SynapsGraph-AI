@@ -111,5 +111,10 @@ export const PaperService = {
   detectResearchGaps: async (projectId) => {
     const res = await api.get(`/research-gaps?project_id=${projectId}`);
     return res.data;
+  },
+
+  getComparisonTable: async (projectId) => {
+    const res = await api.get(`/comparison-table?project_id=${projectId}`);
+    return res.data;
   }
 };

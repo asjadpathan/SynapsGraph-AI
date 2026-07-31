@@ -13,6 +13,7 @@ import Navbar from './components/layout/Navbar';
 
 import DashboardHome from './views/DashboardHome';
 import ResearchPapersView from './views/ResearchPapersView';
+import ComparisonTableView from './views/ComparisonTableView';
 import SemanticSearchView from './views/SemanticSearchView';
 import AiChatView from './views/AiChatView';
 import KnowledgeGraphView from './views/KnowledgeGraphView';
@@ -125,6 +126,7 @@ function MainAppContent() {
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto">
           {currentView === 'dashboard' && <DashboardHome setCurrentView={setCurrentView} />}
           {currentView === 'papers' && <ResearchPapersView />}
+          {currentView === 'comparison-table' && <ComparisonTableView />}
           {currentView === 'upload' && <PdfUploadPage onUploadFinished={() => setScreen('processing')} />}
           {currentView === 'semantic-search' && <SemanticSearchView />}
           {currentView === 'knowledge-graph' && <KnowledgeGraphView />}
