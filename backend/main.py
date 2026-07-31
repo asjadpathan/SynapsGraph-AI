@@ -446,6 +446,47 @@ def build_project_filter(user_id: int, project_id: int):
     }
 
 
+def create_similarity_relationships(paper_id, project_id, user_id, similarity_threshold=0.5, max_similar=5):
+    """After a paper's embedding is saved, finds similar papers in the same project
+    and creates SIMILAR_TO relationships between them in Neo4j."""
+    stored_point = qdrant_client.retrieve(
+        collection_name=QDRANT_COLLECTION,
+        ids=[paper_id],
+        with_vectors=True
+    )
+
+    if not stored_point:
+        return
+
+    source_vector = stored_point[0].vector
+
+    results = qdrant_client.query_points(
+        collection_name=QDRANT_COLLECTION,
+        query=source_vector,
+        limit=max_similar + 1,
+        query_filter=build_project_filter(user_id, project_id)
+    ).points
+
+    with neo4j_driver.session() as session:
+        for r in results:
+            if r.id == paper_id:
+                continue
+            if r.score < similarity_threshold:
+                continue
+
+            session.run(
+                """
+                MATCH (p1:Paper {paper_id: $paper_id_1})
+                MATCH (p2:Paper {paper_id: $paper_id_2})
+                MERGE (p1)-[rel:SIMILAR_TO]-(p2)
+                SET rel.score = $score
+                """,
+                paper_id_1=paper_id,
+                paper_id_2=r.id,
+                score=r.score
+            )
+
+
 # ============================================================
 # PAPER ENDPOINTS (all require login AND a project_id)
 # ============================================================
@@ -503,6 +544,8 @@ async def upload_paper(project_id: int, file: UploadFile = File(...), current_us
         user_id,
         project_id
     )
+
+    create_similarity_relationships(paper_id, project_id, user_id)
 
     return {
         "message": "File uploaded, parsed, saved, added to knowledge graph, and indexed for search",
@@ -629,6 +672,38 @@ def get_author_network(project_id: int, current_user: dict = Depends(get_current
         },
         "top_authors": top_authors,
         "collaborations_by_paper": collaborations_by_paper
+    }
+
+
+@app.get("/paper-similarity-network")
+def get_paper_similarity_network(project_id: int, current_user: dict = Depends(get_current_user)):
+    """Returns the SIMILAR_TO relationships between papers in the given project"""
+    verify_project_ownership(project_id, current_user["user_id"])
+
+    with neo4j_driver.session() as session:
+        result = session.run(
+            """
+            MATCH (p1:Paper)-[r:SIMILAR_TO]-(p2:Paper)
+            WHERE p1.project_id = $project_id AND p2.project_id = $project_id AND p1.paper_id < p2.paper_id
+            RETURN p1.paper_id AS paper_id_1, p1.title AS title_1,
+                   p2.paper_id AS paper_id_2, p2.title AS title_2,
+                   r.score AS score
+            ORDER BY score DESC
+            """,
+            project_id=project_id
+        )
+
+        edges = []
+        for record in result:
+            edges.append({
+                "paper_1": {"paper_id": record["paper_id_1"], "title": record["title_1"]},
+                "paper_2": {"paper_id": record["paper_id_2"], "title": record["title_2"]},
+                "similarity_score": record["score"]
+            })
+
+    return {
+        "total_similarity_links": len(edges),
+        "similarities": edges
     }
 
 
