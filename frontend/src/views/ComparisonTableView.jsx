@@ -79,13 +79,13 @@ export default function ComparisonTableView() {
       }
     }
   }, [activeWorkspace?.project_id, activeWorkspace?.id]);
-
-  // Helper to extract year from venue_and_year string
-  const extractYear = (row) => {
-    if (row.publication_year) return parseInt(row.publication_year, 10);
-    const match = row.venue_and_year?.match(/\b(19|20)\d{2}\b/);
-    return match ? parseInt(match[0], 10) : 0;
-  };
+// Helper to extract year
+const extractYear = (row) => {
+  if (row.publication_year) {
+    return parseInt(row.publication_year, 10);
+  }
+  return 0;
+};
 
   // Format authors array or string to comma separated text
   const formatAuthors = (authors) => {
@@ -110,7 +110,9 @@ export default function ComparisonTableView() {
       filtered = rawRows.filter(row => {
         const titleStr = (row.title || '').toLowerCase();
         const authorsStr = formatAuthors(row.authors).toLowerCase();
-        const venueStr = (row.venue_and_year || '').toLowerCase();
+        const venueStr = (
+          `${row.conference_journal_name || ""} ${row.publication_year || ""}`
+        ).toLowerCase();
         const datasetsStr = (row.datasets || '').toLowerCase();
         const methodsStr = (row.methods || '').toLowerCase();
         const resultsStr = (row.results || '').toLowerCase();
@@ -138,8 +140,8 @@ export default function ComparisonTableView() {
           valA = (a.title || '').toLowerCase();
           valB = (b.title || '').toLowerCase();
         } else if (sortField === 'venue') {
-          valA = (a.venue_and_year || '').toLowerCase();
-          valB = (b.venue_and_year || '').toLowerCase();
+          valA = (a.conference_journal_name || '').toLowerCase();
+          valB = (b.conference_journal_name || '').toLowerCase();
         } else if (sortField === 'year') {
           valA = extractYear(a);
           valB = extractYear(b);
@@ -245,7 +247,9 @@ export default function ComparisonTableView() {
       ...processedRows.map(row => [
         `"${cleanExportText(row.title).replace(/"/g, '""')}"`,
         `"${cleanExportText(formatAuthors(row.authors)).replace(/"/g, '""')}"`,
-        `"${cleanExportText(row.venue_and_year).replace(/"/g, '""')}"`,
+        `"${cleanExportText(
+  `${row.conference_journal_name || ""} ${row.publication_year || ""}`
+).replace(/"/g, '""')}"`
         `"${cleanExportText(row.datasets).replace(/"/g, '""')}"`,
         `"${cleanExportText(row.methods).replace(/"/g, '""')}"`,
         `"${cleanExportText(row.results).replace(/"/g, '""')}"`,
@@ -292,7 +296,9 @@ export default function ComparisonTableView() {
       html += `<tr>
         <td><b>${cleanExportText(row.title)}</b></td>
         <td>${cleanExportText(formatAuthors(row.authors))}</td>
-        <td>${cleanExportText(row.venue_and_year)}</td>
+        <td>${cleanExportText(
+  `${row.conference_journal_name || ""} ${row.publication_year || ""}`
+)}</td>
         <td>${cleanExportText(row.datasets)}</td>
         <td>${cleanExportText(row.methods)}</td>
         <td>${cleanExportText(row.results)}</td>
@@ -359,7 +365,9 @@ export default function ComparisonTableView() {
               <tr>
                 <td class="title-cell">${cleanExportText(row.title)}</td>
                 <td>${cleanExportText(formatAuthors(row.authors))}</td>
-                <td>${cleanExportText(row.venue_and_year)}</td>
+                <td>${cleanExportText(
+                    `${row.conference_journal_name || ""} ${row.publication_year || ""}`
+                )}</td>
                 <td>${cleanExportText(row.datasets)}</td>
                 <td>${cleanExportText(row.methods)}</td>
                 <td>${cleanExportText(row.results)}</td>
@@ -698,10 +706,25 @@ export default function ComparisonTableView() {
                       {/* Cell 3: Venue & Year */}
                       <td className="p-4 align-top min-w-[180px] max-w-[220px] relative">
                         <div className="text-slate-600 dark:text-slate-400 font-medium whitespace-normal break-words pr-6">
-                          {row.venue_and_year || 'Not specified'}
+                          <>
+  {row.conference_journal_name || "Not specified"}
+  {row.publication_year && (
+    <>
+      <br />
+      <span className="text-xs text-slate-500">
+        {row.publication_year}
+      </span>
+    </>
+  )}
+</>
                         </div>
                         <button
-                          onClick={() => handleCopyCell(row.venue_and_year, `venue-${rowId}`)}
+                          onClick={() =>
+                            handleCopyCell(
+                                `${row.conference_journal_name || ""} ${row.publication_year || ""}`,
+                                `venue-${rowId}`
+                            )
+                          }
                           className="opacity-0 group-hover:opacity-100 absolute top-3 right-3 p-1 rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-400 hover:text-brand-600 transition-all shadow-sm"
                           title="Copy venue & year"
                         >

@@ -332,12 +332,13 @@ def find_existing_paper_by_hash(file_hash: str, project_id: int):
 
 
 def parse_pdf_with_grobid(file_path: str):
-    url = f"{GROBID_URL}/api/processHeaderDocument"
+    url = f"{GROBID_URL}/api/processFulltextDocument"
 
     with open(file_path, "rb") as f:
         files = {"input": f}
         headers = {"Accept": "application/xml"}
         response = requests.post(url, files=files, headers=headers)
+        print(response.text)
 
     if response.status_code != 200:
         return {
@@ -367,19 +368,46 @@ def parse_pdf_with_grobid(file_path: str):
     abstract_elem = root.find(".//tei:abstract//tei:p", ns)
     abstract = abstract_elem.text if abstract_elem is not None else "No abstract found"
 
-    # Try to extract venue (conference/journal name)
+    # Extract Conference / Journal Name
     venue = None
-    venue_elem = root.find(".//tei:monogr/tei:title", ns)
-    if venue_elem is not None and venue_elem.text:
-        venue = venue_elem.text
 
-    # Try to extract publication year
+    venue_paths = [
+        ".//tei:monogr/tei:title",
+        ".//tei:sourceDesc//tei:monogr/tei:title",
+        ".//tei:biblStruct/tei:monogr/tei:title",
+        ".//tei:series/tei:title",
+        ".//tei:title[@level='j']",
+        ".//tei:title[@level='m']",
+    ]
+
+    for path in venue_paths:
+        elem = root.find(path, ns)
+        if elem is not None and elem.text:
+            venue = elem.text.strip()
+            break
+
+    # Extract Publication Year
     year = None
-    date_elem = root.find(".//tei:publicationStmt/tei:date", ns)
-    if date_elem is not None:
-        year = date_elem.get("when")
-        if year and len(year) >= 4:
-            year = year[:4]
+
+    date_paths = [
+        ".//tei:publicationStmt/tei:date",
+        ".//tei:imprint/tei:date",
+        ".//tei:monogr//tei:imprint/tei:date",
+    ]
+
+    import re
+
+    for path in date_paths:
+        elem = root.find(path, ns)
+        if elem is not None:
+            if elem.get("when"):
+                year = elem.get("when")[:4]
+                break
+            elif elem.text:
+                match = re.search(r"(19|20)\d{2}", elem.text)
+                if match:
+                    year = match.group(0)
+                    break
 
     return {
         "title": title,
@@ -388,7 +416,47 @@ def parse_pdf_with_grobid(file_path: str):
         "venue": venue,
         "year": year,
     }
+def fetch_metadata_from_openalex(title):
+    import difflib
 
+    url = "https://api.openalex.org/works"
+
+    params = {
+        "search": title,
+        "per_page": 10,
+        "mailto": "frqfurqan@gmail.com"
+    }
+
+    response = requests.get(url, params=params)
+
+    if response.status_code != 200:
+        return None
+
+    data = response.json()
+
+    if not data.get("results"):
+        return None
+
+    best = None
+    best_score = 0
+
+    for paper in data["results"]:
+        oa_title = paper.get("display_name", "")
+
+        score = difflib.SequenceMatcher(
+            None,
+            title.lower(),
+            oa_title.lower()
+        ).ratio()
+
+        if score > best_score:
+            best_score = score
+            best = paper
+
+    if best_score < 0.75:
+        return None
+
+    return best
 
 def save_paper_to_postgres(
     unique_id, filename, file_path, file_hash, parsed_data, user_id, project_id
@@ -718,6 +786,18 @@ async def upload_paper(
         }
 
     parsed_data = parse_pdf_with_grobid(file_path)
+    print(parsed_data)
+    metadata = fetch_metadata_from_openalex(parsed_data["title"])
+    print("OPENALEX =", metadata)
+
+    if metadata:
+        parsed_data["venue"] = (
+            metadata.get("primary_location", {})
+            .get("source", {})
+            .get("display_name")
+        )
+
+        parsed_data["year"] = metadata.get("publication_year")
 
     if "error" in parsed_data:
         return {
@@ -950,44 +1030,42 @@ def get_comparison_table(
     conn.close()
 
     if not rows:
-        return {"message": "No papers found in this project.", "rows": []}
+        return {
+            "message": "No papers found in this project.",
+            "rows": []
+        }
 
     table_rows = []
+
     for paper_id, title, authors, abstract, venue, year in rows:
         details = extract_paper_details_with_gemini(title, abstract or "")
 
-        venue_and_year = venue if venue else "Not specified"
-        if year:
-            venue_and_year += f" ({year})"
-
-        table_rows.append(
-            {
-                "paper_id": paper_id,
-                "title": title,
-                "authors": authors,
-                "venue_and_year": venue_and_year,
-                "datasets": details["datasets"],
-                "methods": details["methods"],
-                "results": details["results"],
-                "gaps": details["gaps"],
-            }
-        )
+        table_rows.append({
+            "paper_id": paper_id,
+            "title": title,
+            "authors": authors,
+            "conference_journal_name": venue if venue else "Not specified",
+            "publication_year": year if year else "Not specified",
+            "datasets": details["datasets"],
+            "methods": details["methods"],
+            "results": details["results"],
+            "gaps": details["gaps"]
+        })
 
     return {
         "total_papers": len(table_rows),
         "columns": [
             "Title",
             "Authors",
-            "Conference/Journal & Year",
+            "Conference/Journal Name",
+            "Publication Year",
             "Datasets",
             "Research Methods",
             "Results/Findings",
-            "Research Gaps/Limitations",
+            "Research Gaps/Limitations"
         ],
-        "rows": table_rows,
+        "rows": table_rows
     }
-
-
 @app.get("/timeline")
 def get_research_timeline(
     project_id: int, current_user: dict = Depends(get_current_user)
