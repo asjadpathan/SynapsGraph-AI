@@ -48,6 +48,12 @@ qdrant_client = QdrantClient(
 
 # Create Gemini client once
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+print("\n========== AVAILABLE GEMINI MODELS ==========\n")
+
+for model in gemini_client.models.list():
+    print(model.name)
+
+print("\n=============================================\n")
 
 # Load embedding model once at server startup
 print("Loading embedding model... (this takes a bit of time the first time)")
@@ -409,12 +415,20 @@ def parse_pdf_with_grobid(file_path: str):
                     year = match.group(0)
                     break
 
+    body_text = []
+
+    for p in root.findall(".//tei:body//tei:p", ns):
+        if p.text:
+            body_text.append(p.text.strip())
+
+    full_text = "\n".join(body_text)
     return {
         "title": title,
         "authors": authors,
         "abstract": abstract,
         "venue": venue,
         "year": year,
+        "full_text": full_text,
     }
 def fetch_metadata_from_openalex(title):
     import difflib
@@ -466,8 +480,21 @@ def save_paper_to_postgres(
 
     cur.execute(
         """
-        INSERT INTO papers (unique_id, filename, file_path, file_hash, title, authors, abstract, user_id, project_id, venue, publication_year)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO papers (
+    unique_id,
+    filename,
+    file_path,
+    file_hash,
+    title,
+    authors,
+    abstract,
+    full_text,
+    user_id,
+    project_id,
+    venue,
+    publication_year
+)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id;
         """,
         (
@@ -478,6 +505,7 @@ def save_paper_to_postgres(
             parsed_data.get("title"),
             parsed_data.get("authors"),
             parsed_data.get("abstract"),
+            parsed_data.get("full_text"),
             user_id,
             project_id,
             parsed_data.get("venue"),
@@ -605,94 +633,127 @@ _DETAILS_CACHE = {}
 
 
 def extract_details_fallback(title: str, abstract: str) -> dict:
-    """Smart heuristic rule-based extraction fallback when LLM API is unavailable or rate-limited"""
-    combined = f"{title} {abstract}".lower()
+    """
+    Rule-based extraction without Gemini.
+    Extracts Datasets, Methods, Results and Gaps from title + abstract.
+    """
 
-    # 1. Methods extraction
-    methods_found = []
-    method_keywords = [
-        ("vgg-scnet", "VGG-SCNet Framework"),
-        ("vgg", "VGG Deep Neural Network"),
-        ("u-net++dsm", "U-Net++DSM with Deep Supervision"),
-        ("u-net", "U-Net Architecture"),
-        ("ru-net2+", "RU-Net2+ Deep Learning Algorithm"),
-        ("efficientnet", "EfficientNet Architecture with Dual Regularization"),
-        ("mobilenetv3", "MobileNetV3 Deep Transfer Learning"),
-        ("vision transformer", "Vision Transformer (ViT)"),
-        ("davit", "Domain-Adapted Vision Transformer (DAViT)"),
-        ("pneux-net", "PneuX-Net Feature Extraction Framework"),
-        ("inception", "Inception-CNN Deep Architecture"),
-        ("cnn-pca", "Hybrid CNN-PCA with Extreme Learning Machine"),
-        ("cnn", "Convolutional Neural Network (CNN)"),
-        ("transfer learning", "Deep Transfer Learning"),
-        ("reinforcement learning", "Reinforcement Learning Agent"),
-        ("genetic algorithm", "Co-Evolutionary Genetic Algorithm"),
-        ("generative adversarial", "Generative Adversarial Networks (GANs)"),
-        ("tri-factorization", "Non-Negative Matrix Tri-Factorization"),
+    import re
+
+    text = f"{title}. {abstract}"
+    lower = text.lower()
+
+    # ---------------- DATASETS ----------------
+
+    dataset_patterns = [
+        r"([A-Z][A-Za-z0-9\-_]*(?:\s+[A-Z][A-Za-z0-9\-_]*)*\sDataset)",
+        r"([A-Z][A-Za-z0-9\-_]*(?:\s+[A-Z][A-Za-z0-9\-_]*)*\sCorpus)",
+        r"(ImageNet|COCO|CIFAR-10|CIFAR-100|MNIST|Fashion-MNIST|BraTS|PubMed|SQuAD|GLUE|LibriSpeech|Wikipedia)"
     ]
-    for key, name in method_keywords:
-        if key in combined:
-            methods_found.append(name)
 
-    methods_str = (
-        ", ".join(methods_found[:3])
-        if methods_found
-        else "Deep Learning & Machine Learning Models"
-    )
+    datasets = []
 
-    # 2. Datasets extraction
-    datasets_found = []
-    dataset_keywords = [
-        ("mri", "MRI Scans & Brain Imaging Data"),
-        ("mr images", "Magnetic Resonance Imaging (MRI) Images"),
-        ("chest x-ray", "Chest X-Ray Dataset"),
-        ("cxr", "Chest X-Ray Imaging Dataset"),
-        ("ct images", "Chest CT Scans Dataset"),
-        ("ct imaging", "Computed Tomography (CT) Scans"),
-        ("brats", "BraTS Benchmark Dataset"),
-        ("clinical", "Clinical Diagnostic Imaging Dataset"),
+    for pattern in dataset_patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        for m in matches:
+            if isinstance(m, tuple):
+                m = m[0]
+            if m not in datasets:
+                datasets.append(m)
+
+    if not datasets:
+        if "dataset" in lower:
+            datasets.append("Dataset mentioned")
+        else:
+            datasets.append("Not specified")
+
+    # ---------------- METHODS ----------------
+
+    keywords = [
+        "bert","roberta","transformer","gpt",
+        "cnn","rnn","lstm","gru",
+        "gan","vae","autoencoder",
+        "svm","random forest","decision tree",
+        "xgboost","lightgbm",
+        "knowledge graph",
+        "graph neural network",
+        "gnn",
+        "retrieval augmented generation",
+        "rag",
+        "deep learning",
+        "machine learning",
+        "transfer learning",
+        "federated learning",
+        "reinforcement learning",
+        "logistic regression",
+        "linear regression",
+        "naive bayes",
+        "k-means"
     ]
-    for key, name in dataset_keywords:
-        if key in combined:
-            datasets_found.append(name)
 
-    datasets_str = (
-        ", ".join(datasets_found[:2])
-        if datasets_found
-        else "Public & Clinical Imaging Datasets"
-    )
+    methods = []
 
-    # 3. Results extraction
-    results_str = "High accuracy in classification, segmentation, and automated diagnostic evaluation."
-    if "segmentation" in combined and "survival" in combined:
-        results_str = (
-            "Accurate brain tumor segmentation and reliable survival rate prediction."
-        )
-    elif "segmentation" in combined:
-        results_str = "Superior multi-class brain lesion segmentation performance."
-    elif "classification" in combined and "grading" in combined:
-        results_str = "Effective automated tumor classification and malignancy grading."
-    elif "classification" in combined or "detecting" in combined:
-        results_str = (
-            "Significant enhancement in detection accuracy and diagnosis speed."
-        )
+    for k in keywords:
+        if k in lower:
+            methods.append(k.title())
 
-    # 4. Gaps & Limitations extraction
-    gaps_str = "Requires evaluation on larger multi-center clinical datasets and real-time deployment validation."
-    if "missing modality" in combined or "missing" in combined:
-        gaps_str = (
-            "Handling missing modalities and clinical scan noise remains a challenge."
-        )
-    elif "review" in combined or "overview" in combined:
-        gaps_str = "Need for standardized benchmark protocols across heterogeneous clinical sites."
-    elif "genetic" in combined or "optimization" in combined:
-        gaps_str = "High computational overhead during hyperparameter optimization."
+    if not methods:
+        methods.append("Not specified")
+
+    # ---------------- RESULTS ----------------
+
+    sentences = re.split(r'(?<=[.!?])\s+', abstract)
+
+    result = "Not specified"
+
+    result_words = [
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "auc",
+        "improved",
+        "outperformed",
+        "better",
+        "performance",
+        "achieved",
+        "significant",
+        "results",
+        "demonstrate"
+    ]
+
+    for s in sentences:
+        if any(w in s.lower() for w in result_words):
+            result = s.strip()
+            break
+
+    # ---------------- GAPS ----------------
+
+    gap = "Not specified"
+
+    gap_words = [
+        "future work",
+        "limitation",
+        "limitations",
+        "however",
+        "challenge",
+        "drawback",
+        "although",
+        "remain",
+        "still",
+        "further research"
+    ]
+
+    for s in reversed(sentences):
+        if any(w in s.lower() for w in gap_words):
+            gap = s.strip()
+            break
 
     return {
-        "datasets": datasets_str,
-        "methods": methods_str,
-        "results": results_str,
-        "gaps": gaps_str,
+        "datasets": ", ".join(datasets[:3]),
+        "methods": ", ".join(methods[:4]),
+        "results": result,
+        "gaps": gap,
     }
 
 
@@ -704,25 +765,76 @@ def extract_paper_details_with_gemini(title: str, abstract: str) -> dict:
     if cache_key in _DETAILS_CACHE:
         return _DETAILS_CACHE[cache_key]
 
-    candidate_models = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"]
+    candidate_models = [
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+]
 
-    prompt = f"""Read the abstract below and extract the following information. If something is not mentioned in the abstract, write "Not specified".
+    paper_text = abstract[:12000]
+    prompt = f"""
+You are an expert research paper analyst.
 
-Title: {title}
-Abstract: {abstract}
+Analyze the following research paper.
 
-Extract these 4 things and respond in EXACTLY this format (no extra text, no markdown):
-DATASETS: <datasets or data sources used>
-METHODS: <research methods, models, or techniques used>
-RESULTS: <key results or findings>
-GAPS: <limitations or gaps mentioned>"""
+Title:
+{title}
 
+Paper:
+{paper_text}
+
+Instructions:
+
+- Read the complete paper carefully.
+- Do NOT generate paragraphs.
+- Return ONLY bullet points.
+- Maximum 5 bullet points in each section.
+- Each bullet should be one short sentence.
+- If information is unavailable, write "Not specified".
+- Extract information from the entire paper, not only the abstract.
+- If datasets, methods, results, or limitations are mentioned anywhere in the paper, include them.
+- Do not return generic statements.
+- Do not repeat the title.
+- Use the exact dataset, model, algorithm, benchmark and evaluation names from the paper whenever possible.
+
+Return EXACTLY in this format:
+
+DATASETS:
+- ...
+
+METHODS:
+- ...
+
+RESULTS:
+- ...
+
+GAPS:
+- ...
+"""
     for model_name in candidate_models:
         try:
             response = gemini_client.models.generate_content(
-                model=model_name, contents=prompt
+                model=model_name,
+                contents=[
+                    {
+                        "role": "user",
+                        "parts": [{"text": prompt}],
+                    }
+                ]
             )
+
             text = response.text
+            print("INPUT LENGTH =", len(abstract))
+            print("OUTPUT LENGTH =", len(text))
+            print("FIRST 500 CHARS OF INPUT =")
+            print(abstract[:500])
+
+            print("\n========== GEMINI RESPONSE ==========")
+            print("MODEL:", model_name)
+            print("TITLE:", title)
+            print(text)
+            print("=====================================\n")
+
             if text:
                 details = {
                     "datasets": "Not specified",
@@ -730,25 +842,52 @@ GAPS: <limitations or gaps mentioned>"""
                     "results": "Not specified",
                     "gaps": "Not specified",
                 }
+                current_section = None
+
                 for line in text.split("\n"):
-                    if line.startswith("DATASETS:"):
-                        details["datasets"] = line.replace("DATASETS:", "").strip()
-                    elif line.startswith("METHODS:"):
-                        details["methods"] = line.replace("METHODS:", "").strip()
-                    elif line.startswith("RESULTS:"):
-                        details["results"] = line.replace("RESULTS:", "").strip()
-                    elif line.startswith("GAPS:"):
-                        details["gaps"] = line.replace("GAPS:", "").strip()
+                    line = line.strip()
+
+                    if line == "DATASETS:":
+                        current_section = "datasets"
+                        continue
+
+                    elif line == "METHODS:":
+                        current_section = "methods"
+                        continue
+
+                    elif line == "RESULTS:":
+                        current_section = "results"
+                        continue
+
+                    elif line == "GAPS:":
+                        current_section = "gaps"
+                        continue
+
+                    if current_section and (
+                        line.startswith("-")
+                        or line.startswith("•")
+                        or line.startswith("*")
+                    ):
+                        value = line.lstrip("-•* ").strip()
+
+                        if details[current_section] == "Not specified":
+                            details[current_section] = value
+                        else:
+                            details[current_section] += "\n• " + value
 
                 if any(v != "Error" and v != "Not specified" for v in details.values()):
                     _DETAILS_CACHE[cache_key] = details
                     return details
         except Exception as e:
+            print(f"Gemini Error ({model_name}): {e}")
             continue
 
-    fallback = extract_details_fallback(title, abstract)
-    _DETAILS_CACHE[cache_key] = fallback
-    return fallback
+    return {
+    "datasets": "Gemini unavailable",
+    "methods": "Gemini unavailable",
+    "results": "Gemini unavailable",
+    "gaps": "Gemini unavailable"
+    }
 
 
 # ============================================================
@@ -786,17 +925,19 @@ async def upload_paper(
         }
 
     parsed_data = parse_pdf_with_grobid(file_path)
+    print("STEP 1: GROBID parsing completed")
     print(parsed_data)
     metadata = fetch_metadata_from_openalex(parsed_data["title"])
     print("OPENALEX =", metadata)
 
     if metadata:
-        parsed_data["venue"] = (
-            metadata.get("primary_location", {})
-            .get("source", {})
-            .get("display_name")
-        )
+        primary_location = metadata.get("primary_location") or {}
+        source = primary_location.get("source") or {}
 
+        print("PRIMARY LOCATION =", primary_location)
+        print("SOURCE =", source)
+
+        parsed_data["venue"] = source.get("display_name", "Unknown Venue")
         parsed_data["year"] = metadata.get("publication_year")
 
     if "error" in parsed_data:
@@ -1022,7 +1163,7 @@ def get_comparison_table(
     conn = get_postgres_connection()
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, title, authors, abstract, venue, publication_year FROM papers WHERE project_id = %s AND title IS NOT NULL;",
+        "SELECT id, title, authors, abstract, full_text, venue, publication_year FROM papers WHERE project_id = %s AND title IS NOT NULL;",
         (project_id,),
     )
     rows = cur.fetchall()
@@ -1037,8 +1178,17 @@ def get_comparison_table(
 
     table_rows = []
 
-    for paper_id, title, authors, abstract, venue, year in rows:
-        details = extract_paper_details_with_gemini(title, abstract or "")
+    for paper_id, title, authors, abstract, full_text, venue, year in rows:
+        print("\n==============================")
+        print("PAPER:", title)
+        print("ABSTRACT:", abstract[:200] if abstract else "NO ABSTRACT")
+        print("==============================")
+        details = extract_paper_details_with_gemini(
+            title,
+            (full_text if full_text else abstract) or ""
+        )
+        
+        print("DETAILS =", details)
 
         table_rows.append({
             "paper_id": paper_id,
