@@ -23,6 +23,7 @@ export default function AiChatView() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+  const [language, setLanguage] = useState('English');
 
   const handleSend = async (questionText) => {
     const textToQuery = questionText || input;
@@ -35,7 +36,12 @@ export default function AiChatView() {
     setErrorMsg('');
 
     try {
-      const res = await PaperService.askQuestion(activeWorkspace.project_id, textToQuery);
+      const res = await PaperService.askQuestion(
+        activeWorkspace.project_id,
+        textToQuery,
+        3,
+        language
+      );
       const aiMsg = {
         id: Date.now() + 1,
         sender: 'ai',
@@ -129,6 +135,28 @@ export default function AiChatView() {
 
         {/* Bottom Input Area */}
         <div className="p-4 border-t border-slate-200 dark:border-slate-800 space-y-3 bg-white dark:bg-slate-900">
+          <div className="flex items-center gap-2">
+  <label className="text-xs font-bold text-slate-500">
+    🌐 Language:
+  </label>
+
+  <select
+    value={language}
+    onChange={(e) => setLanguage(e.target.value)}
+    className="px-3 py-2 text-xs rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white outline-none"
+  >
+    <option value="English">English</option>
+    <option value="Hindi">Hindi</option>
+    <option value="Marathi">Marathi</option>
+    <option value="Urdu">Urdu</option>
+    <option value="Bengali">Bengali</option>
+    <option value="Telugu">Telugu</option>
+    <option value="Tamil">Tamil</option>
+    <option value="Gujarati">Gujarati</option>
+    <option value="Kannada">Kannada</option>
+    <option value="Malayalam">Malayalam</option>
+  </select>
+</div>
           <form onSubmit={(e) => { e.preventDefault(); handleSend(); }} className="relative">
             <input
               type="text"

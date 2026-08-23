@@ -93,10 +93,12 @@ export const PaperService = {
     return res.data;
   },
 
-  askQuestion: async (projectId, question, contextLimit = 3) => {
-    const res = await api.get(`/ask?question=${encodeURIComponent(question)}&project_id=${projectId}&context_limit=${contextLimit}`);
-    return res.data;
-  },
+  askQuestion: async (projectId, question, contextLimit = 3, language = 'English') => {
+  const res = await api.get(
+    `/ask?question=${encodeURIComponent(question)}&project_id=${projectId}&context_limit=${contextLimit}&language=${encodeURIComponent(language)}`
+  );
+  return res.data;
+},
 
   generateLiteratureReview: async (projectId, topic, paperLimit = 8) => {
     const res = await api.get(`/literature-review?topic=${encodeURIComponent(topic)}&project_id=${projectId}&paper_limit=${paperLimit}`);

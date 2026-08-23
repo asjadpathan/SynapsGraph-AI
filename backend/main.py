@@ -766,7 +766,7 @@ def extract_paper_details_with_gemini(title: str, abstract: str) -> dict:
         return _DETAILS_CACHE[cache_key]
 
     candidate_models = [
-    "gemini-3.6-flash",
+    
     "gemini-3.5-flash",
     "gemini-flash-latest",
 ]
@@ -1249,6 +1249,43 @@ def get_research_timeline(
         timeline.append({"month": row[0], "paper_count": row[1], "titles": row[2]})
 
     return {"timeline": timeline, "total_months": len(timeline)}
+def translate_text(text: str, target_language: str) -> str:
+    if target_language.lower() == "english":
+        return text
+
+    translation_prompt = f"""
+Translate the following research assistant response into {target_language}.
+
+Rules:
+- Preserve the exact meaning.
+- Do not add or remove information.
+- Preserve bullet points and formatting.
+- Keep technical terms, paper titles, author names,
+  dataset names and model names unchanged where appropriate.
+- Return ONLY the translated response.
+
+Response:
+{text}
+"""
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=translation_prompt
+        )
+        return response.text
+
+    except ClientError:
+        raise HTTPException(
+            status_code=429,
+            detail="Translation service quota exceeded."
+        )
+
+    except ServerError:
+        raise HTTPException(
+            status_code=503,
+            detail="Translation service is temporarily busy."
+        )
 
 
 @app.get("/ask")
@@ -1256,6 +1293,7 @@ def ask_question(
     question: str,
     project_id: int,
     context_limit: int = 3,
+    language: str = "English",
     current_user: dict = Depends(get_current_user),
 ):
     """Takes a user question, finds relevant papers (from the given project), and generates an answer using Gemini"""
@@ -1296,7 +1334,7 @@ Answer:"""
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3.6-flash", contents=prompt
+            model="gemini-3.5-flash", contents=prompt
         )
 
     except ClientError:
@@ -1310,7 +1348,23 @@ Answer:"""
             detail="Gemini is temporarily busy. Please try again in a few seconds.",
         )
 
-    return {"question": question, "answer": response.text, "sources": sources}
+    print("========== TRANSLATION DEBUG ==========")
+    print("Selected Language:", language)
+    print("Original Answer:", response.text)
+
+    translated_answer = translate_text(
+        response.text,
+        language
+    )
+
+    print("Translated Answer:", translated_answer)
+
+    return {
+    "question": question,
+    "answer": translated_answer,
+    "language": language,
+    "sources": sources
+}
 
 
 @app.get("/literature-review")
@@ -1362,7 +1416,7 @@ Write the literature review now:"""
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3.6-flash", contents=prompt
+            model="gemini-3.5-flash", contents=prompt
         )
 
     except ClientError:
@@ -1490,7 +1544,7 @@ Provide your analysis now:"""
 
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3.6-flash", contents=prompt
+            model="gemini-3.5-flash", contents=prompt
         )
 
     except ClientError:
