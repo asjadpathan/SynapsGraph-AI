@@ -19,6 +19,9 @@ from sentence_transformers import SentenceTransformer
 from google import genai
 from google.genai.errors import ClientError, ServerError
 import redis
+import hashlib
+import json
+import time
 
 load_dotenv()
 
@@ -430,6 +433,7 @@ def parse_pdf_with_grobid(file_path: str):
         "year": year,
         "full_text": full_text,
     }
+
 def fetch_metadata_from_openalex(title):
     import difflib
 
@@ -438,28 +442,32 @@ def fetch_metadata_from_openalex(title):
     params = {
         "search": title,
         "per_page": 10,
-        "mailto": "frqfurqan@gmail.com"
+        "mailto": "frqfurqan@gmail.com",
     }
 
-    response = requests.get(url, params=params)
-
-    if response.status_code != 200:
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as e:
+        print(f"OpenAlex metadata error: {e}")
         return None
 
-    data = response.json()
+    results = data.get("results", [])
 
-    if not data.get("results"):
+    if not results:
         return None
 
     best = None
     best_score = 0
+    normalized_title = (title or "").strip().lower()
 
-    for paper in data["results"]:
-        oa_title = paper.get("display_name", "")
+    for paper in results:
+        oa_title = (paper.get("display_name") or "").strip()
 
         score = difflib.SequenceMatcher(
             None,
-            title.lower(),
+            normalized_title,
             oa_title.lower()
         ).ratio()
 
@@ -467,10 +475,56 @@ def fetch_metadata_from_openalex(title):
             best_score = score
             best = paper
 
-    if best_score < 0.75:
+    if best is None or best_score < 0.75:
         return None
 
+    # Extract authors in their published order.
+    authors = [
+        authorship.get("author", {}).get("display_name")
+        for authorship in best.get("authorships", [])
+        if authorship.get("author", {}).get("display_name")
+    ]
+
+    # Extract journal/conference and publication details.
+    primary_location = best.get("primary_location") or {}
+    source = primary_location.get("source") or {}
+    biblio = best.get("biblio") or {}
+
+    first_page = biblio.get("first_page")
+    last_page = biblio.get("last_page")
+
+    pages = None
+    if first_page and last_page:
+        pages = (
+            first_page if first_page == last_page
+            else f"{first_page}-{last_page}"
+        )
+    elif first_page:
+        pages = first_page
+
+    doi = best.get("doi")
+    if doi:
+        doi = doi.replace("https://doi.org/", "").replace(
+            "http://doi.org/", ""
+        ).strip()
+
+    # Preserve the original OpenAlex record for existing code.
+    # Add normalized citation metadata separately.
+    best["_citation_metadata"] = {
+        "authors": authors,
+        "title": best.get("display_name"),
+        "venue": source.get("display_name"),
+        "year": best.get("publication_year"),
+        "volume": biblio.get("volume"),
+        "issue": biblio.get("issue"),
+        "pages": pages,
+        "article_number": None,
+        "doi": doi,
+    }
+
     return best
+
+
 
 def save_paper_to_postgres(
     unique_id, filename, file_path, file_hash, parsed_data, user_id, project_id
@@ -478,23 +532,33 @@ def save_paper_to_postgres(
     conn = get_postgres_connection()
     cur = conn.cursor()
 
+    metadata = parsed_data.get("citation_metadata") or {}
+
     cur.execute(
         """
         INSERT INTO papers (
-    unique_id,
-    filename,
-    file_path,
-    file_hash,
-    title,
-    authors,
-    abstract,
-    full_text,
-    user_id,
-    project_id,
-    venue,
-    publication_year
-)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            unique_id,
+            filename,
+            file_path,
+            file_hash,
+            title,
+            authors,
+            abstract,
+            full_text,
+            user_id,
+            project_id,
+            venue,
+            publication_year,
+            volume,
+            issue,
+            pages,
+            article_number,
+            doi
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s
+        )
         RETURNING id;
         """,
         (
@@ -503,13 +567,19 @@ VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             file_path,
             file_hash,
             parsed_data.get("title"),
-            parsed_data.get("authors"),
+            metadata.get("authors") or parsed_data.get("authors"),
             parsed_data.get("abstract"),
             parsed_data.get("full_text"),
             user_id,
             project_id,
-            parsed_data.get("venue"),
-            parsed_data.get("year"),
+            metadata.get("venue") or parsed_data.get("venue"),
+            str(metadata.get("year") or parsed_data.get("year") or "")
+            or None,
+            metadata.get("volume"),
+            metadata.get("issue"),
+            metadata.get("pages"),
+            metadata.get("article_number"),
+            metadata.get("doi"),
         ),
     )
 
@@ -555,7 +625,16 @@ def create_paper_node_in_neo4j(
             )
 
 
-def save_embedding_to_qdrant(paper_id, title, abstract, user_id, project_id):
+def save_embedding_to_qdrant(
+    paper_id,
+    title,
+    abstract,
+    authors,
+    venue,
+    year,
+    user_id,
+    project_id,
+):
     """Generates an embedding for the paper's title+abstract and saves it in Qdrant,
     tagged with the owning user and project so searches can be scoped correctly."""
     text_to_embed = f"{title}. {abstract}"
@@ -570,13 +649,15 @@ def save_embedding_to_qdrant(paper_id, title, abstract, user_id, project_id):
                 payload={
                     "title": title,
                     "abstract": abstract,
+                    "authors": authors,
+                    "venue": venue,
+                    "year": year,
                     "user_id": user_id,
                     "project_id": project_id,
                 },
             )
         ],
     )
-
 
 def build_project_filter(user_id: int, project_id: int):
     """Builds a Qdrant filter that scopes results to a specific user's specific project"""
@@ -930,15 +1011,36 @@ async def upload_paper(
     metadata = fetch_metadata_from_openalex(parsed_data["title"])
     print("OPENALEX =", metadata)
 
+    
     if metadata:
+        citation_metadata = metadata.get("_citation_metadata") or {}
+
         primary_location = metadata.get("primary_location") or {}
         source = primary_location.get("source") or {}
 
-        print("PRIMARY LOCATION =", primary_location)
-        print("SOURCE =", source)
+        parsed_data["citation_metadata"] = citation_metadata
 
-        parsed_data["venue"] = source.get("display_name", "Unknown Venue")
-        parsed_data["year"] = metadata.get("publication_year")
+        parsed_data["authors"] = (
+            citation_metadata.get("authors")
+            or parsed_data.get("authors", [])
+        )
+
+        parsed_data["venue"] = (
+            citation_metadata.get("venue")
+            or source.get("display_name")
+            or parsed_data.get("venue")
+        )
+
+        parsed_data["year"] = (
+            citation_metadata.get("year")
+            or metadata.get("publication_year")
+            or parsed_data.get("year")
+        )
+
+        print("CITATION METADATA =", citation_metadata)
+    else:
+        parsed_data["citation_metadata"] = {}
+
 
     if "error" in parsed_data:
         return {
@@ -962,12 +1064,15 @@ async def upload_paper(
     )
 
     save_embedding_to_qdrant(
-        paper_id,
-        parsed_data.get("title", ""),
-        parsed_data.get("abstract", ""),
-        user_id,
-        project_id,
-    )
+    paper_id,
+    parsed_data.get("title", ""),
+    parsed_data.get("abstract", ""),
+    parsed_data.get("authors", []),
+    parsed_data.get("venue", ""),
+    parsed_data.get("year", ""),
+    user_id,
+    project_id,
+)
 
     create_similarity_relationships(paper_id, project_id, user_id)
 
@@ -1151,71 +1256,122 @@ def get_paper_similarity_network(
     return {"total_similarity_links": len(edges), "similarities": edges}
 
 
+
 @app.get("/comparison-table")
 def get_comparison_table(
-    project_id: int, current_user: dict = Depends(get_current_user)
+    project_id: int,
+    current_user: dict = Depends(get_current_user)
 ):
-    """Generates a 7-column comparison table across all papers in the project:
-    Title, Authors, Venue & Year, Datasets, Methods, Results/Findings, Gaps/Limitations
-    """
+    """Return cached Gemini analysis for each paper when available."""
+
     verify_project_ownership(project_id, current_user["user_id"])
 
     conn = get_postgres_connection()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT id, title, authors, abstract, full_text, venue, publication_year FROM papers WHERE project_id = %s AND title IS NOT NULL;",
-        (project_id,),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
 
-    if not rows:
+    try:
+        cur.execute(
+            """
+            SELECT id, title, authors, abstract, full_text, venue, publication_year
+            FROM papers
+            WHERE project_id = %s AND title IS NOT NULL
+            ORDER BY id;
+            """,
+            (project_id,),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            return {
+                "message": "No papers found in this project.",
+                "rows": []
+            }
+
+        table_rows = []
+
+        for paper_id, title, authors, abstract, full_text, venue, year in rows:
+            source_text = full_text or abstract or ""
+
+            # Detect changes in paper content.
+            content_hash = hashlib.sha256(
+                source_text.encode("utf-8")
+            ).hexdigest()
+
+            # Reuse the saved analysis if it exists.
+            cur.execute(
+                """
+                SELECT result
+                FROM paper_analysis_cache
+                WHERE paper_id = %s
+                  AND analysis_type = %s
+                  AND content_hash = %s;
+                """,
+                (paper_id, "comparison_table", content_hash),
+            )
+            cached = cur.fetchone()
+
+            if cached:
+                details = cached[0]
+                if isinstance(details, str):
+                    details = json.loads(details)
+                print(f"Using cached analysis for paper {paper_id}")
+
+            else:
+                # Generate only if no matching cached result exists.
+                details = extract_paper_details_with_gemini(
+                    title,
+                    source_text
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO paper_analysis_cache
+                        (paper_id, analysis_type, content_hash, result)
+                    VALUES (%s, %s, %s, %s::jsonb)
+                    ON CONFLICT (paper_id, analysis_type, content_hash)
+                    DO NOTHING;
+                    """,
+                    (
+                        paper_id,
+                        "comparison_table",
+                        content_hash,
+                        json.dumps(details),
+                    ),
+                )
+                conn.commit()
+                print(f"Saved new analysis for paper {paper_id}")
+
+            table_rows.append({
+                "paper_id": paper_id,
+                "title": title,
+                "authors": authors,
+                "conference_journal_name": venue or "Not specified",
+                "publication_year": year or "Not specified",
+                "datasets": details.get("datasets", []),
+                "methods": details.get("methods", []),
+                "results": details.get("results", []),
+                "gaps": details.get("gaps", [])
+            })
+
         return {
-            "message": "No papers found in this project.",
-            "rows": []
+            "total_papers": len(table_rows),
+            "columns": [
+                "Title",
+                "Authors",
+                "Conference/Journal Name",
+                "Publication Year",
+                "Datasets",
+                "Research Methods",
+                "Results/Findings",
+                "Research Gaps/Limitations"
+            ],
+            "rows": table_rows
         }
 
-    table_rows = []
+    finally:
+        cur.close()
+        conn.close()
 
-    for paper_id, title, authors, abstract, full_text, venue, year in rows:
-        print("\n==============================")
-        print("PAPER:", title)
-        print("ABSTRACT:", abstract[:200] if abstract else "NO ABSTRACT")
-        print("==============================")
-        details = extract_paper_details_with_gemini(
-            title,
-            (full_text if full_text else abstract) or ""
-        )
-        
-        print("DETAILS =", details)
-
-        table_rows.append({
-            "paper_id": paper_id,
-            "title": title,
-            "authors": authors,
-            "conference_journal_name": venue if venue else "Not specified",
-            "publication_year": year if year else "Not specified",
-            "datasets": details["datasets"],
-            "methods": details["methods"],
-            "results": details["results"],
-            "gaps": details["gaps"]
-        })
-
-    return {
-        "total_papers": len(table_rows),
-        "columns": [
-            "Title",
-            "Authors",
-            "Conference/Journal Name",
-            "Publication Year",
-            "Datasets",
-            "Research Methods",
-            "Results/Findings",
-            "Research Gaps/Limitations"
-        ],
-        "rows": table_rows
-    }
 @app.get("/timeline")
 def get_research_timeline(
     project_id: int, current_user: dict = Depends(get_current_user)
@@ -1367,6 +1523,7 @@ Answer:"""
 }
 
 
+
 @app.get("/literature-review")
 def generate_literature_review(
     topic: str,
@@ -1374,15 +1531,33 @@ def generate_literature_review(
     paper_limit: int = 8,
     current_user: dict = Depends(get_current_user),
 ):
-    """Generates a structured literature review on a given topic using the given project's papers"""
+    """Generate a literature review and cache it in PostgreSQL."""
+
     verify_project_ownership(project_id, current_user["user_id"])
 
+    topic = topic.strip()
+
+    if not topic:
+        raise HTTPException(
+            status_code=400,
+            detail="Topic cannot be empty.",
+        )
+
+    if paper_limit < 1 or paper_limit > 50:
+        raise HTTPException(
+            status_code=400,
+            detail="paper_limit must be between 1 and 50.",
+        )
+
     query_embedding = embedding_model.encode(topic).tolist()
+
     results = qdrant_client.query_points(
         collection_name=QDRANT_COLLECTION,
         query=query_embedding,
         limit=paper_limit,
-        query_filter=build_project_filter(current_user["user_id"], project_id),
+        query_filter=build_project_filter(
+            current_user["user_id"], project_id
+        ),
     ).points
 
     if not results:
@@ -1392,21 +1567,79 @@ def generate_literature_review(
             "sources": [],
         }
 
-    context_text = ""
+    context_parts = []
     sources = []
+
     for r in results:
         title = r.payload.get("title", "Unknown")
         abstract = r.payload.get("abstract", "")
-        context_text += f"\n\nPaper Title: {title}\nAbstract: {abstract}"
-        sources.append({"paper_id": r.id, "title": title, "score": r.score})
 
-    prompt = f"""You are a research assistant. Using ONLY the paper abstracts provided below, write a structured literature review on the topic: "{topic}"
+        context_parts.append(
+            f"Paper Title: {title}\nAbstract: {abstract}"
+        )
+
+        sources.append({
+            "paper_id": r.id,
+            "title": title,
+            "score": r.score,
+        })
+
+    context_text = "\n\n".join(context_parts)
+
+    # Include topic and retrieved paper content in the cache key.
+    cache_input = json.dumps(
+        {
+            "topic": topic.casefold(),
+            "papers": context_parts,
+            "paper_limit": paper_limit,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+    content_hash = hashlib.sha256(
+        cache_input.encode("utf-8")
+    ).hexdigest()
+
+    analysis_type = "literature_review"
+
+    conn = get_postgres_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute(
+            """
+            SELECT result
+            FROM project_analysis_cache
+            WHERE project_id = %s
+              AND analysis_type = %s
+              AND content_hash = %s;
+            """,
+            (project_id, analysis_type, content_hash),
+        )
+
+        cached = cur.fetchone()
+
+        if cached:
+            cached_result = cached[0]
+
+            if isinstance(cached_result, str):
+                cached_result = json.loads(cached_result)
+
+            print(
+                f"Using cached literature review for project {project_id}"
+            )
+            return cached_result
+
+        prompt = f"""You are a research assistant. Using ONLY the paper
+abstracts provided below, write a structured literature review on
+the topic: "{topic}"
 
 Structure your review with these sections:
 1. Introduction - briefly introduce the topic and why it matters
 2. Key Themes - summarize the main approaches/methods found across the papers
 3. Common Findings - what results or conclusions do multiple papers agree on
-4. Research Gaps - based on what's missing or under-explored across these papers, suggest potential gaps
+4. Research Gaps - suggest potential gaps based on missing or under-explored areas
 5. Conclusion - a short wrap-up
 
 Papers:
@@ -1414,29 +1647,209 @@ Papers:
 
 Write the literature review now:"""
 
+        response = None
+
+        # Retry temporary Gemini server errors up to 3 attempts.
+        for attempt in range(3):
+            try:
+                response = gemini_client.models.generate_content(
+                    model="gemini-3.5-flash",
+                    contents=prompt,
+                )
+                break
+
+            except ServerError as e:
+                print(
+                    f"Gemini server error, attempt {attempt + 1}/3:",
+                    repr(e),
+                )
+
+                if attempt == 2:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Gemini is temporarily unavailable after "
+                            "3 attempts. Please try again later."
+                        ),
+                    )
+
+                time.sleep(2 * (attempt + 1))
+
+            except ClientError as e:
+                print("Gemini client error:", repr(e))
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Gemini API request failed. Check quota, "
+                        "API access, and model configuration."
+                    ),
+                )
+
+        result = {
+            "topic": topic,
+            "review": response.text or "",
+            "papers_used": len(sources),
+            "sources": sources,
+        }
+
+        cur.execute(
+            """
+            INSERT INTO project_analysis_cache
+                (project_id, analysis_type, content_hash, result)
+            VALUES (%s, %s, %s, %s::jsonb)
+            ON CONFLICT (project_id, analysis_type, content_hash)
+            DO NOTHING;
+            """,
+            (
+                project_id,
+                analysis_type,
+                content_hash,
+                json.dumps(result),
+            ),
+        )
+
+        conn.commit()
+
+        print(
+            f"Saved new literature review for project {project_id}"
+        )
+
+        return result
+
+    finally:
+        cur.close()
+        conn.close()
+
+def format_ieee_citation(
+    authors,
+    title,
+    venue,
+    year,
+    volume=None,
+    issue=None,
+    pages=None,
+    article_number=None,
+    doi=None,
+):
+    import json
+
+    # Handle authors stored as JSON text
+    if isinstance(authors, str):
+        try:
+            parsed = json.loads(authors)
+            authors = parsed if isinstance(parsed, list) else [authors]
+        except (json.JSONDecodeError, TypeError):
+            authors = [authors] if authors.strip() else []
+
+    formatted_authors = []
+
+    for author in authors or []:
+        if not isinstance(author, str):
+            continue
+
+        author = author.strip()
+        if not author:
+            continue
+
+        parts = author.split()
+
+        if len(parts) >= 2:
+            initials = " ".join(
+                f"{part[0].upper()}." for part in parts[:-1]
+            )
+            formatted_authors.append(f"{initials} {parts[-1]}")
+        else:
+            formatted_authors.append(author)
+
+    if len(formatted_authors) == 1:
+        author_text = formatted_authors[0]
+    elif len(formatted_authors) == 2:
+        author_text = " and ".join(formatted_authors)
+    elif formatted_authors:
+        author_text = ", ".join(formatted_authors[:-1])
+        author_text += f", and {formatted_authors[-1]}"
+    else:
+        author_text = ""
+
+    citation = f"{author_text}, " if author_text else ""
+    citation += f'“{(title or "Untitled").strip()},”'
+
+    if venue:
+        citation += f" {venue.strip()}"
+    if volume:
+        citation += f", vol. {volume}"
+    if issue:
+        citation += f", no. {issue}"
+    if pages:
+        citation += f", pp. {pages}"
+    elif article_number:
+        citation += f", Art. no. {article_number}"
+    if year:
+        citation += f", {year}"
+    if doi:
+        doi = str(doi).strip()
+        doi = doi.removeprefix("https://doi.org/")
+        doi = doi.removeprefix("http://doi.org/")
+        citation += f", doi: {doi}"
+
+    return citation.rstrip(" ,") + "."
+
+
+@app.get("/paper-citation")
+def get_paper_citation(
+    paper_id: int,
+    project_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Returns the IEEE citation for one selected paper."""
+
+    verify_project_ownership(project_id, current_user["user_id"])
+
+    conn = get_postgres_connection()
     try:
-        response = gemini_client.models.generate_content(
-            model="gemini-3.5-flash", contents=prompt
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT title, authors, venue, publication_year,
+                       volume, issue, pages, article_number, doi
+                FROM papers
+                WHERE id = %s
+                  AND project_id = %s
+                  AND user_id = %s;
+                """,
+                (paper_id, project_id, current_user["user_id"]),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail="Paper not found or you do not have access to this paper",
         )
 
-    except ClientError:
-        raise HTTPException(
-            status_code=429, detail="Gemini API quota exceeded. Please try again later."
-        )
+    (
+        title, authors, venue, year,
+        volume, issue, pages, article_number, doi,
+    ) = row
 
-    except ServerError:
-        raise HTTPException(
-            status_code=503,
-            detail="Gemini is temporarily busy. Please try again in a few seconds.",
-        )
+    citation = format_ieee_citation(
+        authors=authors,
+        title=title,
+        venue=venue,
+        year=year,
+        volume=volume,
+        issue=issue,
+        pages=pages,
+        article_number=article_number,
+        doi=doi,
+    )
 
     return {
-        "topic": topic,
-        "review": response.text,
-        "papers_used": len(sources),
-        "sources": sources,
+        "paper_id": paper_id,
+        "citation": citation,
     }
-
 
 @app.get("/recommend-citations")
 def recommend_citations(
@@ -1478,13 +1891,22 @@ def recommend_citations(
     for r in results:
         if r.id != paper_id:
             recommendations.append(
-                {
-                    "paper_id": r.id,
-                    "score": r.score,
-                    "title": r.payload.get("title"),
-                    "abstract": r.payload.get("abstract"),
-                }
-            )
+    {
+        "paper_id": r.id,
+        "score": r.score,
+        "title": r.payload.get("title"),
+        "abstract": r.payload.get("abstract"),
+        "authors": r.payload.get("authors", []),
+        "venue": r.payload.get("venue", ""),
+        "year": r.payload.get("year", ""),
+        "citation": format_ieee_citation(
+            authors=r.payload.get("authors", []),
+            title=r.payload.get("title", ""),
+            venue=r.payload.get("venue", ""),
+            year=r.payload.get("year", ""),
+        ),
+    }
+)
 
     return {
         "source_paper": {
@@ -1495,71 +1917,165 @@ def recommend_citations(
     }
 
 
+
+
 @app.get("/research-gaps")
 def detect_research_gaps(
-    project_id: int, current_user: dict = Depends(get_current_user)
+    project_id: int,
+    current_user: dict = Depends(get_current_user)
 ):
-    """Analyzes all of the given project's papers together and identifies potential research gaps"""
+    """Analyze project papers and reuse cached research-gap results."""
+
     verify_project_ownership(project_id, current_user["user_id"])
 
     conn = get_postgres_connection()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT title, abstract FROM papers WHERE project_id = %s AND title IS NOT NULL;",
-        (project_id,),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
 
-    if len(rows) < 2:
-        return {
-            "message": "Not enough papers to detect meaningful research gaps. Upload at least 2-3 papers on a related topic first.",
-            "gaps": None,
-        }
+    try:
+        cur.execute(
+            """
+            SELECT title, abstract
+            FROM papers
+            WHERE project_id = %s AND title IS NOT NULL
+            ORDER BY id;
+            """,
+            (project_id,),
+        )
+        rows = cur.fetchall()
 
-    context_text = ""
-    paper_titles = []
-    for title, abstract in rows:
-        context_text += f"\n\nPaper Title: {title}\nAbstract: {abstract}"
-        paper_titles.append(title)
+        if len(rows) < 2:
+            return {
+                "message": (
+                    "Not enough papers to detect meaningful research gaps. "
+                    "Upload at least 2-3 related papers first."
+                ),
+                "gaps": None,
+            }
 
-    prompt = f"""You are a research analyst. Below are the titles and abstracts of {len(rows)} research papers collected by a researcher.
+        paper_titles = []
+        context_parts = []
 
-Analyze these papers TOGETHER as a collection and identify potential RESEARCH GAPS - meaning:
-- Topics, methods, or combinations that appear under-explored across these papers
-- Limitations that multiple papers share in common
-- Directions that seem like natural next steps but haven't been covered
-- Missing comparisons or datasets that could strengthen this body of work
+        for title, abstract in rows:
+            title = title or ""
+            abstract = abstract or ""
+            paper_titles.append(title)
+            context_parts.append(
+                f"Paper Title: {title}\nAbstract: {abstract}"
+            )
 
-Structure your response as:
-1. Summary of the Collection - what this set of papers is broadly about
-2. Identified Research Gaps - a numbered list of specific, actionable gaps
-3. Suggested Future Directions - brief suggestions on what could be explored next
+        context_text = "\n\n".join(context_parts)
+
+        content_hash = hashlib.sha256(
+            context_text.encode("utf-8")
+        ).hexdigest()
+
+        analysis_type = "research_gaps"
+
+        cur.execute(
+            """
+            SELECT result
+            FROM project_analysis_cache
+            WHERE project_id = %s
+              AND analysis_type = %s
+              AND content_hash = %s;
+            """,
+            (project_id, analysis_type, content_hash),
+        )
+
+        cached = cur.fetchone()
+
+        if cached:
+            result = cached[0]
+
+            if isinstance(result, str):
+                result = json.loads(result)
+
+            print(f"Using cached research gaps for project {project_id}")
+            return result
+
+        prompt = f"""You are a research analyst. Analyze these
+{len(rows)} research papers together to identify potential research gaps.
+
+Identify:
+- Under-explored topics, methods, and combinations
+- Shared limitations
+- Natural next steps not yet covered
+- Missing comparisons or datasets
+
+Structure the response as:
+1. Summary of the Collection
+2. Identified Research Gaps - specific, actionable gaps
+3. Suggested Future Directions
 
 Papers:
 {context_text}
 
 Provide your analysis now:"""
 
-    try:
-        response = gemini_client.models.generate_content(
-            model="gemini-3.5-flash", contents=prompt
+        response = None
+
+        for attempt in range(3):
+            try:
+                response = gemini_client.models.generate_content(
+                    model="gemini-3.5-flash",
+                    contents=prompt,
+                )
+                break
+
+            except ServerError as e:
+                print(
+                    f"Gemini server error, attempt {attempt + 1}/3:",
+                    repr(e),
+                )
+
+                if attempt == 2:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "Gemini is temporarily unavailable after "
+                            "3 attempts. Please try again later."
+                        ),
+                    )
+
+                time.sleep(2 * (attempt + 1))
+
+            except ClientError as e:
+                print("Gemini client error:", repr(e))
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        "Gemini API request failed. Check quota, "
+                        "API access, and model configuration."
+                    ),
+                )
+
+        result = {
+            "papers_analyzed": len(rows),
+            "paper_titles": paper_titles,
+            "gap_analysis": response.text or "",
+        }
+
+        cur.execute(
+            """
+            INSERT INTO project_analysis_cache
+                (project_id, analysis_type, content_hash, result)
+            VALUES (%s, %s, %s, %s::jsonb)
+            ON CONFLICT (project_id, analysis_type, content_hash)
+            DO NOTHING;
+            """,
+            (
+                project_id,
+                analysis_type,
+                content_hash,
+                json.dumps(result),
+            ),
         )
 
-    except ClientError:
-        raise HTTPException(
-            status_code=429, detail="Gemini API quota exceeded. Please try again later."
-        )
+        conn.commit()
 
-    except ServerError:
-        raise HTTPException(
-            status_code=503,
-            detail="Gemini is temporarily busy. Please try again in a few seconds.",
-        )
+        print(f"Saved new research gaps for project {project_id}")
+        return result
 
-    return {
-        "papers_analyzed": len(rows),
-        "paper_titles": paper_titles,
-        "gap_analysis": response.text,
-    }
+    finally:
+        cur.close()
+        conn.close()

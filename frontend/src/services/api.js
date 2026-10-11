@@ -105,10 +105,12 @@ export const PaperService = {
     return res.data;
   },
 
-  recommendCitations: async (projectId, paperId, limit = 5) => {
-    const res = await api.get(`/recommend-citations?paper_id=${paperId}&project_id=${projectId}&limit=${limit}`);
-    return res.data;
-  },
+  getPaperCitation: async (projectId, paperId) => {
+  const res = await api.get(
+    `/paper-citation?paper_id=${paperId}&project_id=${projectId}`
+  );
+  return res.data;
+},
 
   detectResearchGaps: async (projectId) => {
     const res = await api.get(`/research-gaps?project_id=${projectId}`);

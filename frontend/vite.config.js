@@ -19,6 +19,7 @@ export default defineConfig({
       '/ask': 'http://localhost:8000',
       '/literature-review': 'http://localhost:8000',
       '/recommend-citations': 'http://localhost:8000',
+      '/paper-citation': 'http://localhost:8000',
       '/research-gaps': 'http://localhost:8000',
       '/comparison-table': 'http://localhost:8000',
       '/health': 'http://localhost:8000',

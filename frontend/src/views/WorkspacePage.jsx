@@ -32,7 +32,8 @@ export default function WorkspacePage({ onSelectWorkspace, onCreateWorkspaceClic
     setLoading(true);
     try {
       const created = await createWorkspace(newWsName, newWsDesc);
-      onSelectWorkspace(created);
+      selectWorkspace(created);
+      onCreateWorkspaceClick();
     } catch (err) {
       console.error("Workspace creation failed:", err);
     } finally {

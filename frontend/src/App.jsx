@@ -68,10 +68,13 @@ function MainAppContent() {
   }
 
   // After login -> Open Workspace Selection Page
-  if (screen === 'workspace') {
+   if (screen === 'workspace') {
     return (
       <WorkspacePage
-        onSelectWorkspace={(ws) => setScreen('upload')}
+        onSelectWorkspace={(ws) => {
+          setCurrentView('dashboard');
+          setScreen('dashboard');
+        }}
         onCreateWorkspaceClick={() => setScreen('upload')}
       />
     );

@@ -30,7 +30,7 @@ export const MENU_ITEMS = [
   { id: 'semantic-search', label: 'Semantic Search', icon: Search },
   { id: 'knowledge-graph', label: 'Knowledge Graph', icon: Network },
   { id: 'ai-chat', label: 'AI Chat', icon: MessageSquare },
-  { id: 'citation-rec', label: 'Citation Recommendation', icon: BookmarkPlus },
+  { id: 'citation-rec', label: 'Generate Citation', icon: BookmarkPlus },
   { id: 'lit-review', label: 'Literature Review', icon: BookOpen },
   { id: 'research-trends', label: 'Research Trends', icon: TrendingUp },
   { id: 'research-gaps', label: 'Research Gaps', icon: Sparkles },
