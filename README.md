@@ -1,4 +1,4 @@
-# 🧠 SynapsGraph AI — Intelligent Research Paper Discovery & Knowledge Graph Platform
+# 🧠 SynapsGraph AI — Intelligent Research Paper Discovery & Knowledge Graph Platform 
 
 > An AI-powered platform for uploading, parsing, organizing, and analyzing research papers using **Semantic Search**, **Knowledge Graphs**, **Citation Recommendations**, **Literature Reviews**, and **Research Gap Analysis** — all from your own paper library.
 
